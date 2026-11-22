@@ -1,0 +1,65 @@
+name: skrible
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-skrible}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skrible_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-skrible}
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-skrible} -d ${POSTGRES_DB:-skrible}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "${REDIS_PORT:-56379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  server:
+    profiles: ["full"]
+    build:
+      context: ..
+      dockerfile: apps/server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgres://${POSTGRES_USER:-skrible}:${POSTGRES_PASSWORD:-skrible_dev_password}@postgres:5432/${POSTGRES_DB:-skrible}
+      REDIS_URL: redis://redis:6379
+      INSTANCE_ID: ${INSTANCE_ID:-server-1}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      AUTH_TOKEN_TTL_DAYS: ${AUTH_TOKEN_TTL_DAYS:-30}
+      MM_MIN: ${MM_MIN:-2}
+      MM_MAX: ${MM_MAX:-8}
+      MM_WAIT_MS: ${MM_WAIT_MS:-45000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+    ports:
+      - "${SERVER_PORT:-3001}:3001"
+
+volumes:
+  pgdata:
+  redisdata:
