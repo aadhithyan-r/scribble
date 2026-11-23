@@ -28,8 +28,12 @@ test("names are sanitised, capped and screened", () => {
   assert.equal(maskProfanity("this is shit"), "this is s***");
 });
 
-test("avatars resolve to a fixed allow-list", () => {
+test("avatars accept legacy ids and composable strings", () => {
   assert.equal(resolveAvatar("panda"), "panda");
+  assert.equal(resolveAvatar("c3_e1_m4"), "c3_e1_m4");
+  assert.equal(resolveAvatar("c11_e10_m9"), "c11_e10_m9");
+  assert.equal(resolveAvatar("C03_E01_M04"), "c3_e1_m4");
+  assert.equal(resolveAvatar("c99_e0_m0"), "fox");
   assert.equal(resolveAvatar("not-an-avatar"), "fox");
   assert.equal(resolveAvatar(undefined), "fox");
 });

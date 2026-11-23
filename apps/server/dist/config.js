@@ -15,6 +15,8 @@ const envSchema = z.object({
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
     TRUST_PROXY: z.string().optional(),
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(15_000),
+    /** How long a dropped seat is held open for a reconnect. */
+    RECONNECT_GRACE_MS: z.coerce.number().int().min(1000).max(120_000).default(45_000),
 });
 /** Validates and normalizes environment configuration. Throws with readable messages. */
 export function loadConfig(env = process.env) {
@@ -55,5 +57,6 @@ export function loadConfig(env = process.env) {
         logLevel: value.LOG_LEVEL,
         trustProxy: value.TRUST_PROXY === "1" || value.TRUST_PROXY === "true",
         shutdownTimeoutMs: value.SHUTDOWN_TIMEOUT_MS,
+        reconnectGraceMs: value.RECONNECT_GRACE_MS,
     };
 }

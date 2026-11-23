@@ -55,6 +55,7 @@ async function main() {
         corsOrigins: config.corsOrigins,
         ...(config.adminToken ? { adminToken: config.adminToken } : {}),
         trustProxy: config.trustProxy,
+        reconnectGraceMs: config.reconnectGraceMs,
     });
     await server.ready;
     await new Promise((resolve, reject) => {

@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { z } from "zod";
-import { Game, GameError, GAME_LIMITS, publicRoom, } from "./game.js";
+import { Game, GameError, GAME_LIMITS, publicRoom, publicRoomSummary, } from "./game.js";
 import { accuracyOf, ProfileStore } from "./profiles.js";
 import { Matchmaker } from "./matchmaking.js";
 import { ReportStore } from "./moderation.js";
@@ -40,6 +40,8 @@ const strokePointsSchema = z
     .object({
     id: strokeIdSchema,
     points: z.array(pointSchema).min(1).max(GAME_LIMITS.maxPointChunk),
+    /** Monotonic per-stroke chunk number; retransmits are ignored. */
+    seq: z.number().int().min(1).max(1_000_000).optional(),
 })
     .strict();
 const strokeIdPayloadSchema = z.object({ id: strokeIdSchema }).strict();
@@ -56,11 +58,12 @@ const configureSchema = z
     customWordsEnabled: z.boolean().optional(),
     allowSpectators: z.boolean().optional(),
     requireInvite: z.boolean().optional(),
+    visibility: z.enum(["private", "public"]).optional(),
 })
     .strict()
     .refine((value) => Object.keys(value).length > 0, { message: "No settings supplied" });
-/** How long a seat is held open after a network drop mid-game. */
-const DISCONNECT_GRACE_MS = 30_000;
+/** Default seat hold after a drop; overridable for tests and deployments. */
+const DEFAULT_RECONNECT_GRACE_MS = 45_000;
 const DEFAULT_LIMITS = {
     auth: { windowMs: 60_000, max: 20 },
     room: { windowMs: 60_000, max: 30 },
@@ -98,6 +101,7 @@ export function createGameServer(options = {}) {
     const infra = options.infra;
     const logger = options.logger ?? silentLogger;
     const instanceId = infra?.instanceId ?? "in-memory";
+    const reconnectGraceMs = Math.max(1_000, options.reconnectGraceMs ?? DEFAULT_RECONNECT_GRACE_MS);
     const app = express();
     app.disable("x-powered-by");
     app.use(helmet({ crossOriginResourcePolicy: false }));
@@ -130,6 +134,12 @@ export function createGameServer(options = {}) {
         cors: { origin: originCheck },
         transports: ["websocket", "polling"],
         maxHttpBufferSize: 1e6,
+        // Socket.IO restores rooms and missed packets for short drops. The seat and
+        // game state still go through room:resync, because socket ids change.
+        connectionStateRecovery: {
+            maxDisconnectionDuration: reconnectGraceMs,
+            skipMiddlewares: false,
+        },
     });
     if (infra)
         io.adapter(createAdapter(infra.redis.publisher, infra.redis.subscriber));
@@ -139,6 +149,8 @@ export function createGameServer(options = {}) {
     const matchmaker = new Matchmaker(options.matchmaking);
     const disconnectTimers = new Map();
     const saveTimers = new Map();
+    /** Session token -> the one socket currently allowed to act as that seat. */
+    const seatSockets = new Map();
     /** Profile binding per socket. Tokens stay on the client; never logged. */
     const identities = new Map();
     const rateLimits = { ...DEFAULT_LIMITS };
@@ -242,6 +254,28 @@ export function createGameServer(options = {}) {
                 .catch((error) => logger.warn({ err: error, code }, "failed to drop room snapshot"));
         }
     };
+    /**
+     * One seat, one live socket. A fast app restart can reconnect with the same
+     * session token before the old socket has timed out; replace that binding
+     * instead of creating two seats or letting both draw.
+     */
+    const bindSeatSocket = (socket, token, code) => {
+        const previous = seatSockets.get(token);
+        if (previous && previous !== socket.id) {
+            const stale = io.sockets.sockets.get(previous);
+            if (stale) {
+                stale.emit("session:replaced", {
+                    error: "This seat was resumed from another connection.",
+                });
+                stale.leave(code);
+                stale.data.replaced = true;
+                stale.disconnect(true);
+            }
+            identities.delete(previous);
+        }
+        seatSockets.set(token, socket.id);
+        socket.data.seatToken = token;
+    };
     /** Holds a disconnected seat for the reconnect grace period, then releases it. */
     const scheduleSeatRemoval = (code, token) => {
         const pending = disconnectTimers.get(token);
@@ -254,8 +288,10 @@ export function createGameServer(options = {}) {
                 current?.spectators.find((spectator) => spectator.sessionToken === token);
             if (!current || !seat || seat.connected)
                 return;
+            if (seatSockets.get(token) === seat.id)
+                seatSockets.delete(token);
             roomRemoved(code, game.removePlayer(seat.id));
-        }, DISCONNECT_GRACE_MS);
+        }, reconnectGraceMs);
         timer.unref?.();
         disconnectTimers.set(token, timer);
     };
@@ -484,6 +520,7 @@ export function createGameServer(options = {}) {
             if (!socket || !seat)
                 continue;
             socket.join(room.code);
+            seatSockets.set(seat.sessionToken, entry.socketId);
             if (infra) {
                 void infra.presence
                     .setRoom(entry.socketId, entry.profileId, room.code)
@@ -636,6 +673,11 @@ export function createGameServer(options = {}) {
         /** A socket may only occupy one seat, so drop any previous room first. */
         const detachFromPreviousRoom = () => {
             const previous = roomOf();
+            const previousToken = socket.data.seatToken;
+            if (previousToken && seatSockets.get(previousToken) === socket.id) {
+                seatSockets.delete(previousToken);
+            }
+            socket.data.seatToken = undefined;
             if (infra) {
                 void infra.matchmaker
                     .cancel(socket.id, instanceId)
@@ -873,6 +915,7 @@ export function createGameServer(options = {}) {
                 detachFromPreviousRoom();
                 const room = game.createRoom(socket.id, profile.name, profile.id, profile.avatar);
                 socket.join(room.code);
+                bindSeatSocket(socket, room.players[0].sessionToken, room.code);
                 if (infra) {
                     const hostSeat = room.players[0];
                     if (hostSeat) {
@@ -938,6 +981,8 @@ export function createGameServer(options = {}) {
                 socket.join(joined.room.code);
                 const seat = joined.room.players.find((player) => player.id === socket.id) ??
                     joined.room.spectators.find((spectator) => spectator.id === socket.id);
+                if (seat)
+                    bindSeatSocket(socket, seat.sessionToken, joined.room.code);
                 if (infra && seat) {
                     void infra.presence
                         .setRoom(socket.id, profile.id, joined.room.code)
@@ -993,6 +1038,7 @@ export function createGameServer(options = {}) {
                     token: identity?.token ?? "",
                 });
                 socket.join(room.code);
+                bindSeatSocket(socket, seat.sessionToken, room.code);
                 if (infra) {
                     void infra.presence
                         .setRoom(socket.id, seat.profileId, room.code)
@@ -1008,12 +1054,91 @@ export function createGameServer(options = {}) {
                     sessionToken: seat.sessionToken,
                     spectator: spectator != null,
                     profile: profile ? publicProfile(profile) : undefined,
+                    recovered: socket.recovered,
                 });
                 emitRoom(room);
             }
             catch (error) {
                 fail(ack, error);
             }
+        });
+        let resyncTokens = 3;
+        let resyncRefillAt = Date.now();
+        const takeResyncToken = () => {
+            const now = Date.now();
+            resyncTokens = Math.min(3, resyncTokens + (now - resyncRefillAt) / 1000);
+            resyncRefillAt = now;
+            if (resyncTokens < 1)
+                return false;
+            resyncTokens -= 1;
+            return true;
+        };
+        /**
+         * Explicit recovery handshake. Works after a transport drop, after the OS
+         * killed the socket, or after a server restart (seat token + Redis room
+         * snapshot), and returns one complete authoritative snapshot.
+         */
+        socket.on("room:resync", async (payload, ack) => {
+            try {
+                const data = z
+                    .object({ code: codeSchema.optional(), token: z.string().min(8).max(128).optional() })
+                    .strict()
+                    .parse(payload ?? {});
+                if (!takeResyncToken()) {
+                    ack?.({ ok: false, code: "RATE_LIMITED", error: "Resyncing too often. Wait a moment." });
+                    return;
+                }
+                if ((data.code && !data.token) || (!data.code && data.token)) {
+                    throw new ValidationError("INVALID_SESSION", "Send both the room code and seat token");
+                }
+                let room = roomOf();
+                if (!room && data.code && data.token) {
+                    const code = data.code.toUpperCase();
+                    const candidate = game.rooms.get(code);
+                    const candidateSeat = candidate?.players.find((player) => player.sessionToken === data.token) ??
+                        candidate?.spectators.find((spectator) => spectator.sessionToken === data.token);
+                    if (infra && candidate && candidateSeat) {
+                        if (await infra.bans.isBanned(candidateSeat.profileId, candidate.roomId)) {
+                            throw new GameError("BANNED", "You were banned from this room");
+                        }
+                    }
+                    const resumed = game.resumeSession(code, data.token, socket.id);
+                    room = resumed.room;
+                    const timer = disconnectTimers.get(data.token);
+                    if (timer) {
+                        clearTimeout(timer);
+                        disconnectTimers.delete(data.token);
+                    }
+                }
+                if (!room)
+                    throw new GameError("NOT_IN_ROOM", "No room to resync. Rejoin from home.");
+                socket.join(room.code);
+                const seat = room.players.find((player) => player.id === socket.id) ??
+                    room.spectators.find((spectator) => spectator.id === socket.id);
+                if (!seat)
+                    throw new GameError("NOT_IN_ROOM", "No seat in this room");
+                bindSeatSocket(socket, seat.sessionToken, room.code);
+                if (infra) {
+                    void infra.presence
+                        .setRoom(socket.id, seat.profileId, room.code)
+                        .catch((error) => logger.warn({ err: error }, "failed to record room presence"));
+                }
+                ack?.({
+                    ok: true,
+                    room: publicRoom(room, socket.id),
+                    sessionToken: seat.sessionToken,
+                    spectator: room.spectators.some((spectator) => spectator.id === socket.id),
+                    recovered: socket.recovered,
+                });
+                emitRoom(room);
+            }
+            catch (error) {
+                fail(ack, error);
+            }
+        });
+        /** Public lobbies anyone may browse from the home screen. */
+        socket.on("rooms:list", (_payload, ack) => {
+            ack?.({ ok: true, rooms: game.listPublicRooms().map(publicRoomSummary) });
         });
         socket.on("room:sync", (_payload, ack) => {
             try {
@@ -1343,6 +1468,17 @@ export function createGameServer(options = {}) {
                     return;
                 const room = requireRoom();
                 const data = beginStrokeSchema.parse(payload);
+                // Retransmitted begin events (ack lost on a mobile network) are no-ops.
+                const existing = room.strokes.find((candidate) => candidate.id === data.id);
+                if (existing && room.drawerId === socket.id && room.status === "drawing") {
+                    ack?.({
+                        ok: true,
+                        seq: existing.seq,
+                        boardVersion: room.boardVersion,
+                        duplicate: true,
+                    });
+                    return;
+                }
                 const stroke = game.beginStroke(room, socket.id, data);
                 scheduleSave(room);
                 socket.to(room.code).emit("draw:stroke:begin", {
@@ -1365,13 +1501,15 @@ export function createGameServer(options = {}) {
                     throw new GameError("RATE_LIMITED", "Slow down");
                 const room = requireRoom();
                 const data = strokePointsSchema.parse(payload);
-                const { stroke } = game.appendStrokePoints(room, socket.id, data.id, data.points);
+                const { stroke, appended } = game.appendStrokePoints(room, socket.id, data.id, data.points, data.seq);
                 scheduleSave(room);
-                socket.to(room.code).emit("draw:stroke:points", {
-                    id: stroke.id,
-                    points: data.points,
-                });
-                ack?.({ ok: true });
+                if (appended > 0) {
+                    socket.to(room.code).emit("draw:stroke:points", {
+                        id: stroke.id,
+                        points: data.points,
+                    });
+                }
+                ack?.({ ok: true, appended });
             }
             catch (error) {
                 fail(ack, error);
@@ -1531,6 +1669,10 @@ export function createGameServer(options = {}) {
         });
         socket.on("disconnect", () => {
             identities.delete(socket.id);
+            const boundToken = socket.data.seatToken;
+            if (boundToken && seatSockets.get(boundToken) === socket.id) {
+                seatSockets.delete(boundToken);
+            }
             if (infra) {
                 void infra.matchmaker
                     .cancel(socket.id, instanceId)
@@ -1550,12 +1692,11 @@ export function createGameServer(options = {}) {
             const seat = player ?? spectator;
             if (!seat)
                 return;
-            // Lobbies are ephemeral; in-game seats are held briefly so a reconnect
-            // (or a flaky mobile network) does not destroy the round.
-            if (room.status === "lobby") {
-                roomRemoved(room.code, game.removePlayer(socket.id));
-                return;
+            if (seatSockets.get(seat.sessionToken) === socket.id) {
+                seatSockets.delete(seat.sessionToken);
             }
+            // Every seat (lobby included) is held for the grace window. A Wi-Fi blip
+            // or a backgrounded app must not remove a player or end their turn.
             game.markDisconnected(socket.id);
             emitRoom(room);
             scheduleSeatRemoval(room.code, seat.sessionToken);
@@ -1585,11 +1726,28 @@ export function createGameServer(options = {}) {
                             continue;
                     }
                     const tick = game.advanceIfExpired(room, now);
-                    if (!tick.changed)
+                    if (tick.changed) {
+                        emitRoom(room);
+                        if (tick.wordOptions)
+                            emitWordOptions(room);
                         continue;
-                    emitRoom(room);
-                    if (tick.wordOptions)
-                        emitWordOptions(room);
+                    }
+                    // Hint letters derive from the turn clock, so reveal them here and
+                    // broadcast only when the visible mask actually changes.
+                    if (game.refreshHints(room, now))
+                        emitRoom(room);
+                }
+                // Rooms only exist while a seat or a watcher exists. Grace timers delete
+                // the seats; this sweep releases the room and its maps immediately after.
+                for (const room of [...game.rooms.values()]) {
+                    if (room.players.length > 0 || room.spectators.length > 0)
+                        continue;
+                    game.forgetRoom(room);
+                    if (infra) {
+                        void infra.roomStore
+                            .remove(room.code)
+                            .catch((error) => logger.warn({ err: error, roomCode: room.code }, "failed to drop empty room"));
+                    }
                 }
                 if (infra) {
                     const expired = await infra.matchmaker.expire(instanceId, now);
@@ -1675,6 +1833,7 @@ export function createGameServer(options = {}) {
         for (const pending of disconnectTimers.values())
             clearTimeout(pending);
         disconnectTimers.clear();
+        seatSockets.clear();
         for (const pending of saveTimers.values())
             clearTimeout(pending);
         saveTimers.clear();

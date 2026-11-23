@@ -11,10 +11,53 @@ export class ValidationError extends Error {
         this.code = code;
     }
 }
-export const AVATARS = ["fox", "panda", "cat", "robot", "alien", "ghost", "lion", "frog"];
+// Legacy ids stay accepted so accounts created before the composable pack keep
+// working. New clients send `cN_eN_mN`, which fits the existing varchar(16)
+// columns without a migration.
+export const AVATARS = [
+    "cat",
+    "ghost",
+    "robot",
+    "alien",
+    "frog",
+    "bolt",
+    "bear",
+    "star",
+    "coffee",
+    "shades",
+    "fox",
+    "panda",
+    "lion",
+];
 export const DEFAULT_AVATAR = "fox";
-export const isAvatar = (value) => typeof value === "string" && AVATARS.includes(value);
-export const resolveAvatar = (value) => (isAvatar(value) ? value : DEFAULT_AVATAR);
+const AVATAR_COLOR_COUNT = 12;
+const AVATAR_EYES_COUNT = 11;
+const AVATAR_MOUTH_COUNT = 10;
+const COMPACT_AVATAR = /^c(\d{1,2})_e(\d{1,2})_m(\d{1,2})$/;
+export const isLegacyAvatar = (value) => typeof value === "string" && AVATARS.includes(value.trim().toLowerCase());
+export const isSerializedAvatar = (value) => {
+    if (typeof value !== "string")
+        return false;
+    const match = COMPACT_AVATAR.exec(value.trim().toLowerCase());
+    if (!match)
+        return false;
+    return (Number(match[1]) < AVATAR_COLOR_COUNT &&
+        Number(match[2]) < AVATAR_EYES_COUNT &&
+        Number(match[3]) < AVATAR_MOUTH_COUNT);
+};
+export const isAvatar = (value) => isLegacyAvatar(value) || isSerializedAvatar(value);
+export const resolveAvatar = (value) => {
+    if (typeof value !== "string")
+        return DEFAULT_AVATAR;
+    const raw = value.trim().toLowerCase();
+    if (isSerializedAvatar(raw)) {
+        const match = COMPACT_AVATAR.exec(raw);
+        return `c${Number(match[1])}_e${Number(match[2])}_m${Number(match[3])}`;
+    }
+    if (AVATARS.includes(raw))
+        return raw;
+    return DEFAULT_AVATAR;
+};
 /**
  * Starter blocklist, intentionally small and non-exhaustive. It is applied to
  * display names, chat (masked) and custom words (rejected). A production build

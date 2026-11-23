@@ -45,6 +45,50 @@ const WORDS = [
 ];
 const isNormalizedPoint = (p) => Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
 const samePoint = (a, b) => a.x === b.x && a.y === b.y;
+/** Indices of characters that participate in guessing hints. */
+const hintIndexes = (word) => {
+    const indexes = [];
+    for (let index = 0; index < word.length; index += 1) {
+        if (/[A-Za-z0-9]/.test(word[index]))
+            indexes.push(index);
+    }
+    return indexes;
+};
+/** Stable pseudo-random reveal order so every client sees the same hint. */
+const hintOrder = (word, indexes) => {
+    let seed = 2166136261;
+    for (const char of word.toLowerCase()) {
+        seed ^= char.charCodeAt(0);
+        seed = Math.imul(seed, 16777619) >>> 0;
+    }
+    const order = [...indexes];
+    for (let index = order.length - 1; index > 0; index -= 1) {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        const swap = seed % (index + 1);
+        [order[index], order[swap]] = [order[swap], order[index]];
+    }
+    return order;
+};
+/**
+ * Derived hint mask: letters are revealed as the turn timer runs, in a stable
+ * order shared by every client. At least one letter always stays hidden so the
+ * word is never fully spoiled before the buzzer.
+ */
+export function maskedWordFor(word, endsAt, drawSeconds, now = Date.now()) {
+    const indexes = hintIndexes(word);
+    const chars = [...word].map((char, index) => (indexes.includes(index) ? "_" : char));
+    if (!endsAt || drawSeconds <= 0 || indexes.length < 2)
+        return chars.join("");
+    const elapsed = Math.min(1, Math.max(0, 1 - (endsAt - now) / (drawSeconds * 1000)));
+    const maxReveals = indexes.length - 1;
+    const reveal = Math.min(maxReveals, Math.floor(elapsed * maxReveals));
+    const order = hintOrder(word, indexes);
+    for (let step = 0; step < reveal; step += 1) {
+        const index = order[step];
+        chars[index] = word[index];
+    }
+    return chars.join("");
+}
 export class Game {
     rooms = new Map();
     playerRoom = new Map();
@@ -61,6 +105,7 @@ export class Game {
                     avatar: resolveAvatar(avatar),
                     score: 0,
                     connected: true,
+                    reconnecting: false,
                     guesses: 0,
                     correctGuesses: 0,
                     sessionToken: randomUUID(),
@@ -124,6 +169,7 @@ export class Game {
                 avatar,
                 score: 0,
                 connected: true,
+                reconnecting: false,
                 guesses: 0,
                 correctGuesses: 0,
                 sessionToken: randomUUID(),
@@ -144,6 +190,7 @@ export class Game {
             name: this.cleanName(name),
             avatar,
             connected: true,
+            reconnecting: false,
             sessionToken: randomUUID(),
         };
         room.spectators.push(spectator);
@@ -178,6 +225,7 @@ export class Game {
                 room.guessed.add(newSocketId);
         }
         seat.connected = true;
+        seat.reconnecting = false;
         return { room, player, spectator };
     }
     markDisconnected(playerId) {
@@ -188,6 +236,7 @@ export class Game {
         if (!seat)
             return undefined;
         seat.connected = false;
+        seat.reconnecting = true;
         return room;
     }
     isSpectator(room, playerId) {
@@ -226,9 +275,13 @@ export class Game {
             room.matchRecorded = true;
             return;
         }
-        room.turnIndex = (room.turnIndex + 1) % count;
-        if (room.turnIndex === 0 && room.drawerId)
+        // Only a full rotation advances the round. The very first turn starts at
+        // index 0 without wrapping, so it never counts as a completed round.
+        room.turnIndex += 1;
+        if (room.turnIndex >= count) {
+            room.turnIndex = 0;
             room.round += 1;
+        }
         if (room.round > room.maxRounds) {
             room.status = "ended";
             room.drawerId = undefined;
@@ -310,6 +363,8 @@ export class Game {
             room.allowSpectators = patch.allowSpectators;
         if (patch.requireInvite !== undefined)
             room.requireInvite = patch.requireInvite;
+        if (patch.visibility !== undefined)
+            room.visibility = patch.visibility;
     }
     /** Replaces the host's word list. Words never appear in public payloads. */
     setCategories(room, playerId, categories) {
@@ -326,6 +381,13 @@ export class Game {
     }
     customWordPool(room) {
         return room.categories.flatMap((category) => category.words);
+    }
+    /** Public lobby summaries. Invite-only rooms stay hidden by design. */
+    listPublicRooms(limit = 20) {
+        return [...this.rooms.values()]
+            .filter((room) => room.visibility === "public" && room.status === "lobby" && !room.requireInvite)
+            .sort((a, b) => b.players.length - a.players.length || a.code.localeCompare(b.code))
+            .slice(0, limit);
     }
     /** Host-only, non-secret share metadata for the invite deep link. */
     inviteFor(room, playerId) {
@@ -360,6 +422,20 @@ export class Game {
             return this.finishTurn(room);
         }
         return this.finishTurn(room);
+    }
+    /**
+     * Recomputes the visible hint mask from the turn clock. Returns true when the
+     * mask changed so the server only broadcasts when a letter is actually
+     * revealed (a handful of times per turn).
+     */
+    refreshHints(room, now = Date.now()) {
+        if (room.status !== "drawing" || !room.secretWord)
+            return false;
+        const next = maskedWordFor(room.secretWord, room.endsAt, room.drawSeconds, now);
+        if (next === room.maskedWord)
+            return false;
+        room.maskedWord = next;
+        return true;
     }
     /** Advances the turn and reports whether a new word choice must be offered. */
     finishTurn(room) {
@@ -494,7 +570,7 @@ export class Game {
         room.boardVersion += 1;
         return stroke;
     }
-    appendStrokePoints(room, playerId, strokeId, points) {
+    appendStrokePoints(room, playerId, strokeId, points, chunkSeq) {
         this.assertActiveDrawer(room, playerId);
         if (!points.length)
             throw new GameError("INVALID_STROKE", "No points supplied");
@@ -504,6 +580,11 @@ export class Game {
         const stroke = room.strokes[room.strokes.length - 1];
         if (!stroke || stroke.id !== strokeId || stroke.complete) {
             throw new GameError("INVALID_STROKE", "That stroke is not accepting points");
+        }
+        // A retransmitted chunk is a no-op, so a flaky mobile network can resend
+        // safely without drawing the same points twice.
+        if (chunkSeq !== undefined && chunkSeq <= (stroke.chunkSeq ?? 0)) {
+            return { stroke, appended: 0 };
         }
         if (room.totalPoints + points.length > GAME_LIMITS.maxRoomPoints) {
             throw new GameError("BOARD_FULL", "The canvas is full. Clear it to keep drawing.");
@@ -522,6 +603,8 @@ export class Game {
             // Keep the stroke bounded; later points are dropped rather than failing the draw.
             stroke.points.length = GAME_LIMITS.maxPointsPerStroke;
         }
+        if (chunkSeq !== undefined)
+            stroke.chunkSeq = chunkSeq;
         room.totalPoints += appended;
         room.boardVersion += 1;
         return { stroke, appended };
@@ -603,7 +686,9 @@ export class Game {
             room.endsAt = undefined;
             room.endedAt = room.endedAt ?? Date.now();
             room.matchRecorded = true;
-            room.hostId = "";
+            // Spectators may still be watching; keep a valid host id so the room
+            // does not end up in an ownerless state while they read the results.
+            room.hostId = room.spectators[0]?.id ?? "";
             this.resetBoard(room);
             if (!room.spectators.length) {
                 this.rooms.delete(code);
@@ -689,6 +774,15 @@ export class Game {
         return code;
     }
 }
+export const publicRoomSummary = (room) => ({
+    code: room.code,
+    hostName: room.players.find((player) => player.id === room.hostId)?.name ?? "Host",
+    players: room.players.length,
+    maxPlayers: room.maxPlayers,
+    round: room.round,
+    maxRounds: room.maxRounds,
+    drawSeconds: room.drawSeconds,
+});
 export const publicRoom = (room, viewerId) => {
     const viewerPlayer = room.players.find((player) => player.id === viewerId);
     const viewerSpectator = room.spectators.find((spectator) => spectator.id === viewerId);
@@ -699,20 +793,22 @@ export const publicRoom = (room, viewerId) => {
         status: room.status,
         round: room.round,
         maxRounds: room.maxRounds,
-        players: room.players.map(({ id, profileId, name, score, connected, avatar }) => ({
+        players: room.players.map(({ id, profileId, name, score, connected, reconnecting, avatar }) => ({
             id,
             profileId,
             name,
             score,
             connected,
+            reconnecting: Boolean(reconnecting),
             avatar,
         })),
-        spectators: room.spectators.map(({ id, profileId, name, avatar, connected }) => ({
+        spectators: room.spectators.map(({ id, profileId, name, avatar, connected, reconnecting }) => ({
             id,
             profileId,
             name,
             avatar,
             connected,
+            reconnecting: Boolean(reconnecting),
         })),
         hostId: room.hostId,
         drawerId: room.drawerId,
@@ -729,10 +825,14 @@ export const publicRoom = (room, viewerId) => {
         startedAt: room.startedAt,
         endedAt: room.endedAt,
         matchId: room.matchId,
-        maskedWord: room.maskedWord,
+        maskedWord: room.status === "drawing" && room.secretWord
+            ? maskedWordFor(room.secretWord, room.endsAt, room.drawSeconds)
+            : room.maskedWord,
         endsAt: room.endsAt,
         strokes: room.strokes,
         boardVersion: room.boardVersion,
+        /** Server clock so clients offset countdowns instead of trusting the device. */
+        serverNow: Date.now(),
         undoDepth: room.strokes.length,
         redoDepth: room.redoStack.length,
         guessedIds: Array.from(room.guessed),
