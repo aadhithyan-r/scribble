@@ -1,0 +1,68 @@
+{
+  "expo": {
+    "name": "Skrible",
+    "slug": "skrible-mobile",
+    "scheme": "skrible",
+    "version": "1.0.0",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "icon": "./assets/icon.png",
+    "backgroundColor": "#FFFDF7",
+    "plugins": [
+      "expo-router",
+      "expo-asset",
+      "expo-secure-store",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 220,
+          "resizeMode": "contain",
+          "backgroundColor": "#FFFDF7"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFFDF7"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.skrible.mobile",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Skrible connects to your self-hosted game server on the local network during development."
+      }
+    },
+    "android": {
+      "package": "com.skrible.mobile",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#FFD600"
+      },
+      "permissions": ["INTERNET", "ACCESS_NETWORK_STATE"],
+      "softwareKeyboardLayoutMode": "resize"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "router": {
+        "origin": false
+      },
+      "eas": {
+        "projectId": "371b5f90-71e0-4728-b7f2-e9eca8369a0a"
+      }
+    }
+  }
+}
