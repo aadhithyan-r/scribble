@@ -3,7 +3,6 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
-  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -22,17 +21,25 @@ import { clearSession, getSession } from "../src/session";
 import type {
   AckResponse,
   ChatMessage,
+  GameOverPayload,
+  MatchPlayerResult,
   MatchRecord,
   PlayerReport,
   Point,
+  Reaction,
   RoomUpdate,
   Stroke,
   Tool,
+  DrawTool,
+  FillRun,
+  TurnSummary,
   WordCategory,
 } from "../src/game/types";
 import { mergeChat } from "../src/game/chat";
 import { request } from "../src/request";
 import {
+  addFill,
+  addShape,
   appendPoints,
   applyClear,
   applyRedo,
@@ -46,9 +53,11 @@ import {
 } from "../src/drawing/board";
 import DrawingCanvas from "../src/components/DrawingCanvas";
 import DrawingToolbar from "../src/components/DrawingToolbar";
-import PlayerStrip from "../src/components/PlayerStrip";
 import ChatPanel from "../src/components/ChatPanel";
 import RoomSettings, { type SettingsPatch } from "../src/components/RoomSettings";
+import MatchPodium from "../src/components/MatchPodium";
+import DrawingGallery from "../src/components/DrawingGallery";
+import { wordCategoryLabel } from "../src/game/words";
 import WordListEditor from "../src/components/WordListEditor";
 import PlayerPanel from "../src/components/PlayerPanel";
 import ErrorBoundary from "../src/components/ErrorBoundary";
@@ -70,14 +79,60 @@ export default function GameScreen() {
   );
 }
 
+function ReactionButton({
+  kind,
+  count,
+  active,
+  disabled,
+  onPress,
+}: {
+  kind: Reaction;
+  count: number;
+  active: boolean;
+  disabled: boolean;
+  onPress: () => void;
+}) {
+  const tone = kind === "like" ? colors.like : colors.nope;
+  return (
+    <View style={styles.reactionOuter}>
+      <View pointerEvents="none" style={styles.reactionShadow} />
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${kind === "like" ? "Like" : "Nope"} drawing, ${count} votes`}
+        accessibilityState={{ selected: active, disabled }}
+        disabled={disabled}
+        onPress={() => onPress()}
+        style={({ pressed }) => [
+          styles.reactionFace,
+          active && { backgroundColor: tone },
+          disabled && !active && styles.reactionFaceLocked,
+          pressed && !disabled && styles.pressed,
+        ]}
+      >
+        <Icon
+          name={kind === "like" ? "thumbUp" : "thumbDown"}
+          size={16}
+          color={active ? colors.ink : tone}
+        />
+        <Text style={styles.reactionLabel}>{kind === "like" ? "LIKE" : "NOPE"}</Text>
+        <View style={styles.reactionCountBox}>
+          <Text style={styles.reactionCountText}>{count}</Text>
+        </View>
+      </Pressable>
+    </View>
+  );
+}
+
 function GameScreenContent() {
   const [room, setRoom] = useState<RoomUpdate | null>(null);
   const [board, setBoard] = useState<Board>(emptyBoard);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [options, setOptions] = useState<string[]>([]);
-  const [tool, setTool] = useState<Tool>("pen");
+  const [tool, setTool] = useState<DrawTool>("brush");
   const [color, setColor] = useState("#000000");
-  const [size, setSize] = useState(10);
+  const [previousColor, setPreviousColor] = useState("#FFFFFF");
+  const [brushSize, setBrushSize] = useState(10);
+  const [eraserSize, setEraserSize] = useState(24);
   const [online, setOnline] = useState(socket.connected);
   const [loading, setLoading] = useState(true);
   const [banner, setBanner] = useState<string | null>(null);
@@ -88,9 +143,15 @@ function GameScreenContent() {
   const [wordCategories, setWordCategories] = useState<WordCategory[]>([]);
   const [mutedIds, setMutedIds] = useState<string[]>([]);
   const [reports, setReports] = useState<PlayerReport[]>([]);
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [canvasBox, setCanvasBox] = useState({ width: 0, height: 0 });
   const [attempt, setAttempt] = useState(0);
+  const [closeGuessToast, setCloseGuessToast] = useState<string | null>(null);
+  const [turnSummary, setTurnSummary] = useState<TurnSummary | null>(null);
+  const [gameOver, setGameOver] = useState<GameOverPayload | null>(null);
+  const [reactionPop, setReactionPop] = useState(false);
+  const closeToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnSummaryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reactionPopTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Monotonic per-stroke chunk number so retransmits are ignored server-side. */
   const chunkSeqRef = useRef(0);
   const pendingSendRef = useRef<{ id: string; points: Point[] } | null>(null);
@@ -116,8 +177,12 @@ function GameScreenContent() {
       strokes: next.strokes ?? [],
       chat: next.chat ?? [],
       guessedIds: next.guessedIds ?? [],
+      reactions: next.reactions ?? { likes: 0, nopes: 0 },
+      myReaction: next.myReaction ?? null,
+      customWordsMode: next.customWordsMode ?? "off",
       customCategories: next.customCategories ?? [],
       customWordCount: next.customWordCount ?? 0,
+      savedWordCount: next.savedWordCount ?? 0,
     };
     setRoom(safe);
     setBoard((previous) =>
@@ -277,16 +342,73 @@ function GameScreenContent() {
       setBoard((previous) => appendPoints(previous, event.id, event.points));
     const onStrokeEnd = (event: { id: string }) =>
       setBoard((previous) => completeStroke(previous, event.id));
+    const onShape = (event: { action: Stroke }) => {
+      const action = event.action;
+      if (action.kind !== "line" && action.kind !== "rect" && action.kind !== "ellipse") return;
+      const { x1, y1, x2, y2 } = action;
+      if (x1 == null || y1 == null || x2 == null || y2 == null) return;
+      setBoard((previous) =>
+        addShape(previous, {
+          id: action.id,
+          seq: action.seq,
+          kind: action.kind as "line" | "rect" | "ellipse",
+          color: action.color,
+          width: action.width,
+          x1,
+          y1,
+          x2,
+          y2,
+        }),
+      );
+    };
+    const onFill = (event: { action: Stroke }) => {
+      const action = event.action;
+      if (action.kind !== "fill" || !action.runs?.length) return;
+      const runs = action.runs;
+      setBoard((previous) =>
+        addFill(previous, { id: action.id, seq: action.seq, color: action.color, runs }),
+      );
+    };
     const onUndo = (event: { strokeId: string; undoDepth: number; redoDepth: number }) =>
       setBoard((previous) => applyUndo(previous, event));
     const onRedo = (event: { stroke: Stroke; undoDepth: number; redoDepth: number }) =>
       setBoard((previous) => applyRedo(previous, event));
-    const onClear = (event: { undoDepth: number; redoDepth: number }) =>
+    const onClear = (event: { undoDepth: number; redoDepth: number; action?: Stroke }) =>
       setBoard((previous) => applyClear(previous, event));
     const onOptions = (words: string[]) => setOptions(words);
     const onChat = (message: ChatMessage) =>
       setMessages((previous) => mergeChat(previous, [message]));
     const onMatchEnded = (record: MatchRecord) => setMatch(record);
+    const onGameOver = (payload: GameOverPayload) => {
+      setGameOver({
+        players: payload.players ?? [],
+        drawingGallery: payload.drawingGallery ?? [],
+        match: payload.match,
+      });
+      if (payload.match) setMatch(payload.match);
+    };
+    const onCloseGuess = (payload: { guess: string }) => {
+      const message: ChatMessage = {
+        id: `close_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        kind: "close",
+        text: `SO CLOSE: "${payload.guess}"`,
+        at: Date.now(),
+      };
+      setMessages((previous) => mergeChat(previous, [message]));
+      setCloseGuessToast("SO CLOSE");
+      if (closeToastTimer.current) clearTimeout(closeToastTimer.current);
+      closeToastTimer.current = setTimeout(() => setCloseGuessToast(null), 2000);
+    };
+    const onReactionUpdate = () => {
+      setReactionPop(true);
+      if (reactionPopTimer.current) clearTimeout(reactionPopTimer.current);
+      reactionPopTimer.current = setTimeout(() => setReactionPop(false), 280);
+    };
+    const onTurnEnd = (summary: TurnSummary) => {
+      setTurnSummary(summary);
+      if (turnSummaryTimer.current) clearTimeout(turnSummaryTimer.current);
+      turnSummaryTimer.current = setTimeout(() => setTurnSummary(null), 3000);
+    };
     const onKicked = (payload: { error?: string }) => {
       clearSession();
       setBanner(null);
@@ -306,12 +428,18 @@ function GameScreenContent() {
     socket.on("draw:stroke:begin", onStrokeBegin);
     socket.on("draw:stroke:points", onStrokePoints);
     socket.on("draw:stroke:end", onStrokeEnd);
+    socket.on("draw:shape", onShape);
+    socket.on("draw:fill", onFill);
     socket.on("draw:undo", onUndo);
     socket.on("draw:redo", onRedo);
     socket.on("draw:clear", onClear);
     socket.on("word:options", onOptions);
     socket.on("chat:message", onChat);
     socket.on("match:ended", onMatchEnded);
+    socket.on("game:over", onGameOver);
+    socket.on("guess:close", onCloseGuess);
+    socket.on("drawing:reactionUpdate", onReactionUpdate);
+    socket.on("turn:end", onTurnEnd);
     socket.on("room:kicked", onKicked);
     socket.on("moderation:muted", onMuted);
 
@@ -330,32 +458,30 @@ function GameScreenContent() {
       socket.off("draw:stroke:begin", onStrokeBegin);
       socket.off("draw:stroke:points", onStrokePoints);
       socket.off("draw:stroke:end", onStrokeEnd);
+      socket.off("draw:shape", onShape);
+      socket.off("draw:fill", onFill);
       socket.off("draw:undo", onUndo);
       socket.off("draw:redo", onRedo);
       socket.off("draw:clear", onClear);
       socket.off("word:options", onOptions);
       socket.off("chat:message", onChat);
       socket.off("match:ended", onMatchEnded);
+      socket.off("game:over", onGameOver);
+      socket.off("guess:close", onCloseGuess);
+      socket.off("drawing:reactionUpdate", onReactionUpdate);
+      socket.off("turn:end", onTurnEnd);
       socket.off("room:kicked", onKicked);
       socket.off("moderation:muted", onMuted);
       if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+      if (closeToastTimer.current) clearTimeout(closeToastTimer.current);
+      if (turnSummaryTimer.current) clearTimeout(turnSummaryTimer.current);
+      if (reactionPopTimer.current) clearTimeout(reactionPopTimer.current);
     };
   }, [applyRoom]);
 
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 500);
     return () => clearInterval(timer);
-  }, []);
-
-  // The keyboard squeezes the game area on Android; drop the player strip so
-  // the guess input and the canvas both stay visible.
-  useEffect(() => {
-    const shown = Keyboard.addListener("keyboardDidShow", () => setKeyboardOpen(true));
-    const hidden = Keyboard.addListener("keyboardDidHide", () => setKeyboardOpen(false));
-    return () => {
-      shown.remove();
-      hidden.remove();
-    };
   }, []);
 
   // Returning from the background is the common mobile failure mode: the OS
@@ -396,16 +522,16 @@ function GameScreenContent() {
   const handleBegin = useCallback(
     (id: string, point: Point) => {
       chunkSeqRef.current = 0;
+      const wireTool: Tool = tool === "eraser" ? "eraser" : "pen";
       const strokeColor = tool === "eraser" ? "#FFFFFF" : color;
-      const strokeWidth =
-        tool === "eraser" ? Math.min(40, Math.round(size * 2.2)) : Math.max(1, Math.round(size));
+      const strokeWidth = tool === "eraser" ? eraserSize : brushSize;
       setBoard((previous) =>
         beginStroke(previous, {
           id,
           seq: previous.strokes.length,
           color: strokeColor,
           width: strokeWidth,
-          tool,
+          tool: wireTool,
           point,
         }),
       );
@@ -414,13 +540,13 @@ function GameScreenContent() {
       if (!socket.connected) return;
       socket.emit(
         "draw:stroke:begin",
-        { id, color: strokeColor, width: strokeWidth, tool },
+        { id, color: strokeColor, width: strokeWidth, tool: wireTool },
         (response: AckResponse) => {
           if (response && !response.ok) report(response.error);
         },
       );
     },
-    [color, report, size, tool],
+    [brushSize, color, eraserSize, report, tool],
   );
 
   const handlePoints = useCallback(
@@ -455,6 +581,65 @@ function GameScreenContent() {
     [flushPendingSend, report],
   );
 
+  const handleShape = useCallback(
+    (id: string, kind: "line" | "rect" | "ellipse", start: Point, end: Point) => {
+      const strokeWidth = brushSize;
+      setBoard((previous) =>
+        addShape(previous, {
+          id,
+          seq: previous.strokes.length,
+          kind,
+          color,
+          width: strokeWidth,
+          x1: start.x,
+          y1: start.y,
+          x2: end.x,
+          y2: end.y,
+        }),
+      );
+      if (!socket.connected) return;
+      socket.emit(
+        "draw:shape",
+        { id, kind, color, width: strokeWidth, x1: start.x, y1: start.y, x2: end.x, y2: end.y },
+        (response: AckResponse) => {
+          if (response && !response.ok) report(response.error);
+        },
+      );
+    },
+    [brushSize, color, report],
+  );
+
+  const handleFill = useCallback(
+    (runs: FillRun[], fillColor: string) => {
+      const id = `fill_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      setBoard((previous) => addFill(previous, { id, seq: previous.strokes.length, color: fillColor, runs }));
+      if (!socket.connected) return;
+      socket.emit("draw:fill", { id, color: fillColor, runs }, (response: AckResponse) => {
+        if (response && !response.ok) report(response.error);
+      });
+    },
+    [report],
+  );
+
+  const handlePickColor = useCallback(
+    (next: string) => {
+      if (next.toUpperCase() !== color.toUpperCase()) setPreviousColor(color);
+      setColor(next);
+      setTool("brush");
+    },
+    [color],
+  );
+
+  const chooseColor = (next: string) => {
+    if (next.toUpperCase() !== color.toUpperCase()) setPreviousColor(color);
+    setColor(next);
+  };
+
+  const swapColors = () => {
+    setColor(previousColor);
+    setPreviousColor(color);
+  };
+
   const requestUndo = () => {
     socket.emit("draw:undo", {}, (response: AckResponse) => {
       if (response && !response.ok) setBanner(response.error ?? "Nothing to undo");
@@ -468,21 +653,10 @@ function GameScreenContent() {
   };
 
   const confirmClear = () => {
-    Alert.alert(
-      "Clear the canvas?",
-      "Every player's view will be cleared immediately. This cannot be undone.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Clear",
-          style: "destructive",
-          onPress: () =>
-            socket.emit("draw:clear", {}, (response: AckResponse) => {
-              if (response && !response.ok) setBanner(response.error ?? "Couldn't clear the canvas");
-            }),
-        },
-      ],
-    );
+    // Clear is pushed onto the history stack, so a mis-tap is one Undo away.
+    socket.emit("draw:clear", {}, (response: AckResponse) => {
+      if (response && !response.ok) setBanner(response.error ?? "Couldn't clear the canvas");
+    });
   };
 
   const sendChat = (text: string) => {
@@ -634,16 +808,21 @@ function GameScreenContent() {
   const chooseLeft = room.chooseEndsAt
     ? Math.max(0, Math.ceil((room.chooseEndsAt - serverNow) / 1000))
     : null;
-  // One shared 4:3 canvas: normalized stroke coordinates must map to the same
-  // shape on every screen, so this is never stretched to fill. The 9pt reserve
-  // covers the 2.5pt border on both sides plus the 4pt offset shadow.
+  // One shared 4:3 canvas: both roles derive the size from the same box, so
+  // their pure-white canvases stay pixel-identical. The 9pt reserve covers the
+  // border on both sides plus the offset shadow, and the height cap keeps the
+  // dock and chat from ever being pushed off screen.
   const canvasWidth = Math.max(
     0,
-    Math.min(canvasBox.width - 9, (canvasBox.height - 9) * (4 / 3)),
+    Math.min(canvasBox.width - 9, ((canvasBox.height - 9) * 4) / 3),
   );
   const ranking = [...room.players].sort((a, b) => b.score - a.score);
   const iGuessed = room.guessedIds?.includes(socket.id ?? "") ?? false;
   const wordChoices = room.wordChoices?.length ? room.wordChoices : options;
+  const categoryTag =
+    room.wordMode === "category"
+      ? wordCategoryLabel(room.wordCategory ?? "animals")
+      : null;
   const chatDisabled = !online || room.status === "ended" || iGuessed || room.youAreMuted;
   const chatPlaceholder = room.youAreMuted
     ? "You are muted by the host"
@@ -653,7 +832,8 @@ function GameScreenContent() {
         ? "Type your guess…"
         : "Chat with players…";
   const myProfileId = room.players.find((player) => player.id === socket.id)?.profileId;
-  const finalPlayers =
+  const finalPlayers: MatchPlayerResult[] =
+    gameOver?.players ??
     match?.players ??
     ranking.map((player, index) => ({
       profileId: player.profileId,
@@ -665,7 +845,24 @@ function GameScreenContent() {
       guesses: 0,
       correctGuesses: 0,
     }));
-  const myResult = match?.players.find((player) => player.profileId === myProfileId);
+  const myResult = finalPlayers.find((player) => player.profileId === myProfileId);
+  const gallery = gameOver?.drawingGallery ?? room.drawingGallery ?? [];
+  const reactionCounts = room.reactions ?? { likes: 0, nopes: 0 };
+
+  const sendReaction = (reaction: Reaction) => {
+    if (
+      !online ||
+      room.status !== "drawing" ||
+      isDrawer ||
+      isSpectator ||
+      room.myReaction
+    ) {
+      return;
+    }
+    socket.emit("drawing:react", { reaction }, (response: AckResponse) => {
+      if (response && !response.ok) setBanner(response.error ?? "Couldn't send that reaction");
+    });
+  };
 
   return (
     <KeyboardAvoidingView
@@ -698,7 +895,9 @@ function GameScreenContent() {
           <View style={styles.roundTag}>
             <Text style={styles.roundText}>
               {room.status === "lobby" || room.status === "ended"
-                ? `R${room.round}/${room.maxRounds}`
+                ? // The engine increments round past maxRounds to end the match,
+                  // so the badge must clamp instead of showing R2/1 on the podium.
+                  `R${Math.max(1, Math.min(room.round, room.maxRounds))}/${Math.max(1, room.maxRounds)}`
                 : secondsLeft != null
                   ? `${secondsLeft}s`
                   : "—"}
@@ -730,18 +929,29 @@ function GameScreenContent() {
           </View>
         ) : null}
 
-        <View style={styles.body}>
-          {keyboardOpen ? null : (
-            <PlayerStrip
-              players={room.players}
-              drawerId={room.drawerId}
-              hostId={room.hostId}
-              meId={socket.id}
-              guessedIds={room.guessedIds}
-              spectatorCount={room.spectators.length}
-            />
-          )}
+        {turnSummary ? (
+          <View pointerEvents="none" style={styles.turnSummaryOverlay}>
+            <View style={styles.turnSummaryOuter}>
+              <View pointerEvents="none" style={styles.turnSummaryShadow} />
+              <View style={styles.turnSummaryCard}>
+                <Text style={styles.turnSummaryKicker}>TURN {turnSummary.roundNumber} CLOSED</Text>
+                <Text style={styles.turnSummaryTitle}>THE CROWD HAS SPOKEN</Text>
+                <Text style={styles.turnSummaryMeta}>
+                  LIKE {turnSummary.likes} / NOPE {turnSummary.nopes}
+                </Text>
+                {turnSummary.reactionBonus > 0 ? (
+                  <View style={styles.turnBonusPill}>
+                    <Text style={styles.turnBonusText}>
+                      +{turnSummary.reactionBonus} CROWD BONUS
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
+            </View>
+          </View>
+        ) : null}
 
+        <View style={styles.body}>
           {room.status === "drawing" ? (
             <View style={[styles.drawingWrap, landscape && styles.drawingWrapLandscape]}>
               <View style={styles.drawingColumn}>
@@ -749,33 +959,47 @@ function GameScreenContent() {
                   <View style={styles.wordBox}>
                     <Text
                       style={styles.word}
+                      numberOfLines={1}
+                      adjustsFontSizeToFit
                       accessibilityLabel={isDrawer ? "Your word" : "Hidden word"}
                     >
                       {isDrawer ? room.secretWord : room.maskedWord}
                     </Text>
                   </View>
-                  <View style={styles.wordMetaRow}>
-                    <View style={styles.statusPill}>
-                      <Icon
-                        name={isDrawer ? "brush" : isSpectator ? "eye" : iGuessed ? "check" : "info"}
-                        size={13}
-                      />
-                      <Text style={styles.statusText} numberOfLines={1}>
-                        {isSpectator
-                          ? "WATCHING"
-                          : isDrawer
-                            ? "YOU'RE DRAWING"
-                            : iGuessed
-                              ? "YOU GUESSED IT"
-                              : `${(room.drawerName ?? "SOMEONE").toUpperCase()} IS DRAWING`}
+                  <View style={styles.statusPill}>
+                    <Icon
+                      name={isDrawer ? "brush" : isSpectator ? "eye" : iGuessed ? "check" : "info"}
+                      size={13}
+                    />
+                    <Text style={styles.statusText} numberOfLines={1}>
+                      {isSpectator
+                        ? "WATCHING"
+                        : isDrawer
+                          ? "DRAWING"
+                          : iGuessed
+                            ? "GUESSED IT"
+                            : `${(room.drawerName ?? "SOMEONE").toUpperCase()} IS DRAWING`}
+                    </Text>
+                  </View>
+                  {isDrawer ? (
+                    <View
+                      style={[styles.reactionCounter, reactionPop && styles.reactionCounterPop]}
+                      accessibilityLabel={`Crowd reactions, ${reactionCounts.likes} likes and ${reactionCounts.nopes} nopes`}
+                    >
+                      <Icon name="thumbUp" size={12} />
+                      <Text style={styles.reactionCounterText}>{reactionCounts.likes}</Text>
+                      <View style={styles.counterDivider} />
+                      <Icon name="thumbDown" size={12} />
+                      <Text style={styles.reactionCounterText}>{reactionCounts.nopes}</Text>
+                    </View>
+                  ) : null}
+                  {categoryTag ? (
+                    <View style={styles.categoryTag} accessibilityLabel={`Category ${categoryTag}`}>
+                      <Text style={styles.categoryTagText} numberOfLines={1}>
+                        {categoryTag}
                       </Text>
                     </View>
-                    {secondsLeft != null ? (
-                      <View style={styles.countdown}>
-                        <Text style={styles.countdownText}>{secondsLeft}s</Text>
-                      </View>
-                    ) : null}
-                  </View>
+                  ) : null}
                 </View>
 
                 <View
@@ -794,31 +1018,56 @@ function GameScreenContent() {
                         <DrawingCanvas
                           strokes={board.strokes}
                           editable={canDraw}
-                          hint={!isDrawer ? "Watch the drawing" : undefined}
                           width={canvasWidth}
+                          tool={tool}
+                          color={color}
+                          size={tool === "eraser" ? eraserSize : brushSize}
                           onBegin={handleBegin}
                           onPoints={handlePoints}
                           onEnd={handleEnd}
+                          onShape={handleShape}
+                          onFill={handleFill}
+                          onPickColor={handlePickColor}
                         />
                       </View>
                     </View>
                   ) : null}
                 </View>
 
+                {!isDrawer && !isSpectator ? (
+                  <View style={styles.reactionRow}>
+                    <ReactionButton
+                      kind="like"
+                      count={reactionCounts.likes}
+                      active={room.myReaction === "like"}
+                      disabled={room.myReaction != null || !online}
+                      onPress={() => sendReaction("like")}
+                    />
+                    <ReactionButton
+                      kind="nope"
+                      count={reactionCounts.nopes}
+                      active={room.myReaction === "nope"}
+                      disabled={room.myReaction != null || !online}
+                      onPress={() => sendReaction("nope")}
+                    />
+                  </View>
+                ) : null}
+
                 {isDrawer ? (
                   <DrawingToolbar
                     tool={tool}
                     color={color}
-                    size={size}
+                    previousColor={previousColor}
+                    brushSize={brushSize}
+                    eraserSize={eraserSize}
                     canUndo={board.undoDepth > 0}
                     canRedo={board.redoDepth > 0}
                     disabled={!online}
                     onToolChange={setTool}
-                    onColorChange={(next) => {
-                      setColor(next);
-                      setTool("pen");
-                    }}
-                    onSizeChange={setSize}
+                    onColorChange={chooseColor}
+                    onSwapColors={swapColors}
+                    onBrushSizeChange={setBrushSize}
+                    onEraserSizeChange={setEraserSize}
                     onUndo={requestUndo}
                     onRedo={requestRedo}
                     onClear={confirmClear}
@@ -841,6 +1090,7 @@ function GameScreenContent() {
                 disabled={chatDisabled}
                 placeholder={chatPlaceholder}
                 guessed={iGuessed}
+                toast={closeGuessToast}
                 onSend={sendChat}
               />
             </View>
@@ -891,8 +1141,7 @@ function GameScreenContent() {
                             </Text>
                           </View>
                           <Text style={styles.playerMeta}>
-                            {player.id === socket.id ? "YOU · " : ""}
-                            {player.connected ? "READY" : "OFFLINE"}
+                            {`${player.id === socket.id ? "YOU · " : ""}${player.connected ? "READY" : "OFFLINE"}`}
                           </Text>
                         </View>
                       </View>
@@ -937,19 +1186,8 @@ function GameScreenContent() {
                         ? `${match.players.length} players · ${match.rounds} round${match.rounds === 1 ? "" : "s"} · ${new Date(match.at).toLocaleTimeString()}`
                         : "Recording the final results…"}
                     </Text>
-                    {finalPlayers.map((player, index) => (
-                      <View key={`${player.profileId ?? player.name}-${index}`} style={styles.resultRow}>
-                        <View style={styles.rankBox}>
-                          <Text style={styles.rankText}>{player.rank}</Text>
-                        </View>
-                        <AvatarTile value={player.avatar} size={36} hasCrown={player.rank === 1} />
-                        <Text style={styles.resultName} numberOfLines={1}>
-                          {player.name}
-                          {player.profileId === myProfileId ? " (you)" : ""}
-                        </Text>
-                        <Text style={styles.score}>{player.score}</Text>
-                      </View>
-                    ))}
+                    <MatchPodium players={finalPlayers} myProfileId={myProfileId} />
+                    <DrawingGallery items={gallery} />
                     {myResult ? (
                       <Text style={styles.resultNote}>
                         You finished #{myResult.rank} with {myResult.score} points and{" "}
@@ -1012,16 +1250,16 @@ function GameScreenContent() {
                 ) : null}
               </ScrollView>
 
-              {room.status !== "ended" ? (
-                <ChatPanel
-                  style={styles.chatBottom}
-                  messages={messages}
-                  meId={socket.id}
-                  disabled={chatDisabled}
-                  placeholder={chatPlaceholder}
-                  guessed={iGuessed}
-                  onSend={sendChat}
-                />
+              {room.status !== "ended" ? (                  <ChatPanel
+                    style={styles.chatBottom}
+                    messages={messages}
+                    meId={socket.id}
+                    disabled={chatDisabled}
+                    placeholder={chatPlaceholder}
+                    guessed={iGuessed}
+                    toast={closeGuessToast}
+                    onSend={sendChat}
+                  />
               ) : null}
             </>
           )}
@@ -1146,38 +1384,146 @@ const styles = StyleSheet.create({
   drawingWrap: { flex: 1, gap: 7, minHeight: 0 },
   drawingWrapLandscape: { flexDirection: "row" },
   drawingColumn: { flex: 1, gap: 7, minHeight: 0 },
-  wordRow: { gap: 5 },
+  wordRow: { flexDirection: "row", alignItems: "center", gap: 5 },
   wordBox: {
+    flex: 1,
+    minWidth: 0,
     borderWidth: BORDER_WIDTH,
     borderColor: colors.ink,
     borderRadius: radii.sm,
     backgroundColor: colors.surface,
-    paddingVertical: 6,
-    paddingHorizontal: 10,
+    paddingVertical: 5,
+    paddingHorizontal: 8,
     alignItems: "center",
   },
   word: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: "900",
     letterSpacing: 5,
     color: colors.ink,
     textTransform: "uppercase",
     fontFamily: monoFont,
   },
-  wordMetaRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   statusPill: {
-    flex: 1,
+    maxWidth: "46%",
     flexDirection: "row",
     alignItems: "center",
-    gap: 5,
+    gap: 4,
     borderWidth: 2,
     borderColor: colors.ink,
     borderRadius: 7,
     backgroundColor: colors.bg,
-    paddingHorizontal: 7,
+    paddingHorizontal: 6,
     paddingVertical: 4,
   },
   statusText: { fontSize: 8.5, fontWeight: "900", letterSpacing: 0.8, color: colors.ink },
+  categoryTag: {
+    maxWidth: "24%",
+    borderWidth: 2,
+    borderColor: colors.ink,
+    borderRadius: 6,
+    backgroundColor: colors.lavender,
+    paddingHorizontal: 5,
+    paddingVertical: 4,
+  },
+  categoryTagText: {
+    fontSize: 8,
+    fontWeight: "900",
+    letterSpacing: 0.5,
+    color: colors.ink,
+  },
+  drawerReactionRow: { alignItems: "flex-start" },
+  reactionRow: { flexDirection: "row", gap: 7 },
+  reactionOuter: { flex: 1, paddingRight: 3, paddingBottom: 3 },
+  reactionShadow: {
+    position: "absolute",
+    left: 3,
+    top: 3,
+    right: 0,
+    bottom: 0,
+    backgroundColor: colors.ink,
+    borderRadius: 8,
+  },
+  reactionFace: {
+    minHeight: 38,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderWidth: BORDER_WIDTH,
+    borderColor: colors.ink,
+    borderRadius: 8,
+    backgroundColor: colors.surface,
+  },
+  reactionFaceLocked: { opacity: 0.5 },
+  reactionLabel: { fontSize: 9.5, fontWeight: "900", letterSpacing: 0.7, color: colors.ink },
+  reactionCountBox: {
+    minWidth: 21,
+    alignItems: "center",
+    borderWidth: 2,
+    borderColor: colors.ink,
+    borderRadius: 5,
+    backgroundColor: colors.bg,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+  },
+  reactionCountText: { fontSize: 8.5, fontWeight: "900", color: colors.ink, fontFamily: monoFont },
+  reactionCounter: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    alignSelf: "flex-start",
+    borderWidth: 2,
+    borderColor: colors.ink,
+    borderRadius: 7,
+    backgroundColor: colors.surface,
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+  },
+  reactionCounterPop: { backgroundColor: colors.gold, transform: [{ scale: 1.06 }] },
+  reactionCounterText: { fontSize: 8.5, fontWeight: "900", letterSpacing: 0.4, color: colors.ink },
+  counterDivider: { width: 2, height: 11, backgroundColor: colors.ink, marginHorizontal: 2 },
+  turnSummaryOverlay: {
+    position: "absolute",
+    left: 20,
+    right: 20,
+    top: 72,
+    zIndex: 30,
+    alignItems: "center",
+  },
+  turnSummaryOuter: { width: "100%", maxWidth: 360, paddingRight: 4, paddingBottom: 4 },
+  turnSummaryShadow: {
+    position: "absolute",
+    left: 4,
+    top: 4,
+    right: 0,
+    bottom: 0,
+    backgroundColor: colors.ink,
+    borderRadius: 11,
+  },
+  turnSummaryCard: {
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: BORDER_WIDTH,
+    borderColor: colors.ink,
+    borderRadius: 11,
+    backgroundColor: colors.gold,
+  },
+  turnSummaryKicker: { ...type.tiny, fontSize: 8, color: colors.ink, letterSpacing: 1.1 },
+  turnSummaryTitle: { fontSize: 13, fontWeight: "900", letterSpacing: 0.5, color: colors.ink },
+  turnSummaryMeta: { fontSize: 9, fontWeight: "800", letterSpacing: 0.6, color: colors.ink },
+  turnBonusPill: {
+    marginTop: 2,
+    backgroundColor: colors.ink,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  turnBonusText: { fontSize: 9, fontWeight: "900", letterSpacing: 0.7, color: colors.surface },
   countdown: {
     minWidth: 54,
     alignItems: "center",
@@ -1189,7 +1535,7 @@ const styles = StyleSheet.create({
     paddingVertical: 5,
   },
   countdownText: { fontSize: 13, fontWeight: "900", color: colors.surface, fontFamily: monoFont },
-  canvasBox: { flex: 1, minHeight: 56, alignItems: "center", justifyContent: "center" },
+  canvasBox: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center" },
   canvasFrame: { paddingRight: 4, paddingBottom: 4 },
   canvasShadow: {
     position: "absolute",
@@ -1198,16 +1544,16 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     backgroundColor: colors.ink,
-    borderRadius: 12,
+    borderRadius: 14,
   },
   canvasFace: {
-    borderWidth: BORDER_WIDTH,
+    borderWidth: 3,
     borderColor: colors.ink,
-    borderRadius: 12,
-    backgroundColor: colors.surface,
+    borderRadius: 14,
+    backgroundColor: "#FFFFFF",
     overflow: "hidden",
   },
-  chatBottom: { height: 176, flexShrink: 0 },
+  chatBottom: { height: 160, flexShrink: 0 },
   chatSide: { width: 280, height: "100%" },
   note: { ...type.body, fontSize: 11.5, color: "#555", lineHeight: 16 },
   lobbyBody: { padding: 14, gap: 10 },

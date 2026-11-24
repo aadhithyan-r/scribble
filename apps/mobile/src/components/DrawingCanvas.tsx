@@ -1,31 +1,41 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   StyleSheet,
-  Text,
   View,
   type GestureResponderEvent,
   type LayoutChangeEvent,
 } from "react-native";
 import { Canvas, Circle, Path, Skia } from "@shopify/react-native-skia";
-import type { Point, Stroke } from "../game/types";
+import type { DrawTool, FillRun, Point, Stroke } from "../game/types";
 import { normalizeTouch, shouldSamplePoint } from "../drawing/geometry";
+import { floodFillRuns, rasterize, sampleColor } from "../drawing/raster";
 
-/** Stroke widths are authored against a 400pt-wide canvas and scaled per device. */
-const WIDTH_REFERENCE = 400;
+/** Widths are authored in the 1000 x 750 canvas space and scaled per device. */
+const WIDTH_REFERENCE = 1000;
 
 type Callbacks = {
   onBegin: (id: string, point: Point) => void;
   onPoints: (id: string, points: Point[]) => void;
   onEnd: (id: string) => void;
+  onShape: (
+    id: string,
+    kind: "line" | "rect" | "ellipse",
+    start: Point,
+    end: Point,
+  ) => void;
+  onFill: (runs: FillRun[], color: string) => void;
+  onPickColor: (color: string) => void;
 };
 
 type Props = {
   strokes: Stroke[];
   editable: boolean;
-  hint?: string;
   /** Explicit 4:3 size so every device shares one coordinate space. */
   width?: number;
-} & Callbacks;
+  tool?: DrawTool;
+  color?: string;
+  size?: number;
+} & Partial<Callbacks>;
 
 export function buildStrokePath(points: Point[], canvasWidth: number, canvasHeight: number) {
   const path = Skia.Path.Make();
@@ -50,6 +60,9 @@ export function buildStrokePath(points: Point[], canvasWidth: number, canvasHeig
   return path;
 }
 
+const widthFor = (width: number, canvasWidth: number) =>
+  Math.max(1, (width * canvasWidth) / WIDTH_REFERENCE);
+
 const StrokeShape = memo(function StrokeShape({
   stroke,
   canvasWidth,
@@ -60,19 +73,18 @@ const StrokeShape = memo(function StrokeShape({
   canvasHeight: number;
 }) {
   const path = useMemo(
-    () => buildStrokePath(stroke.points, canvasWidth, canvasHeight),
+    () => buildStrokePath(stroke.points ?? [], canvasWidth, canvasHeight),
     [stroke.points, canvasWidth, canvasHeight],
   );
-  const scaledWidth = Math.max(1, (stroke.width * canvasWidth) / WIDTH_REFERENCE);
-
-  if (stroke.points.length === 0) return null;
-  if (stroke.points.length === 1) {
-    const point = stroke.points[0]!;
+  const points = stroke.points ?? [];
+  if (points.length === 0) return null;
+  if (points.length === 1) {
+    const point = points[0]!;
     return (
       <Circle
         cx={point.x * canvasWidth}
         cy={point.y * canvasHeight}
-        r={scaledWidth / 2}
+        r={widthFor(stroke.width, canvasWidth) / 2}
         color={stroke.color}
       />
     );
@@ -82,24 +94,141 @@ const StrokeShape = memo(function StrokeShape({
       path={path}
       color={stroke.color}
       style="stroke"
-      strokeWidth={scaledWidth}
+      strokeWidth={widthFor(stroke.width, canvasWidth)}
       strokeCap="round"
       strokeJoin="round"
     />
   );
 });
 
-const makeStrokeId = () =>
-  `stroke_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+const FillShape = memo(function FillShape({
+  stroke,
+  canvasWidth,
+  canvasHeight,
+}: {
+  stroke: Stroke;
+  canvasWidth: number;
+  canvasHeight: number;
+}) {
+  const path = useMemo(() => {
+    const built = Skia.Path.Make();
+    for (const run of stroke.runs ?? []) {
+      built.addRect(
+        Skia.XYWHRect(
+          run.x * canvasWidth,
+          run.y * canvasHeight,
+          run.w * canvasWidth + 0.6,
+          run.h * canvasHeight + 0.6,
+        ),
+      );
+    }
+    return built;
+  }, [stroke.runs, canvasWidth, canvasHeight]);
+  return <Path path={path} color={stroke.color} />;
+});
 
-export default function DrawingCanvas({ strokes, editable, hint, width, ...callbacks }: Props) {
-  const [size, setSize] = useState({ width: 0, height: 0 });
+const ShapeMark = memo(function ShapeMark({
+  kind,
+  x1,
+  y1,
+  x2,
+  y2,
+  color,
+  width,
+  canvasWidth,
+  canvasHeight,
+  opacity = 1,
+}: {
+  kind: "line" | "rect" | "ellipse";
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  color: string;
+  width: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  opacity?: number;
+}) {
+  const path = useMemo(() => {
+    const built = Skia.Path.Make();
+    const ax = x1 * canvasWidth;
+    const ay = y1 * canvasHeight;
+    const bx = x2 * canvasWidth;
+    const by = y2 * canvasHeight;
+    if (kind === "line") {
+      built.moveTo(ax, ay);
+      built.lineTo(bx, by);
+    } else if (kind === "rect") {
+      built.addRect(Skia.XYWHRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay)));
+    } else {
+      built.addOval(Skia.XYWHRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay)));
+    }
+    return built;
+  }, [kind, x1, y1, x2, y2, canvasWidth, canvasHeight]);
+
+  return (
+    <Path
+      path={path}
+      color={color}
+      opacity={opacity}
+      style="stroke"
+      strokeWidth={widthFor(width, canvasWidth)}
+      strokeCap="round"
+      strokeJoin="round"
+    />
+  );
+});
+
+const makeId = (prefix: string) =>
+  `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+const isShapeTool = (value: DrawTool) =>
+  value === "line" || value === "rect" || value === "circle";
+const shapeKind = (value: DrawTool): "line" | "rect" | "ellipse" =>
+  value === "circle" ? "ellipse" : value === "rect" ? "rect" : "line";
+
+export default function DrawingCanvas({
+  strokes,
+  editable,
+  width,
+  tool = "brush",
+  color = "#000000",
+  size = 10,
+  onBegin,
+  onPoints,
+  onEnd,
+  onShape,
+  onFill,
+  onPickColor,
+}: Props) {
+  const [measured, setMeasured] = useState({ width: 0, height: 0 });
+  const [ring, setRing] = useState<Point | null>(null);
+  const [preview, setPreview] = useState<{
+    kind: "line" | "rect" | "ellipse";
+    start: Point;
+    end: Point;
+  } | null>(null);
+
   const strokeIdRef = useRef<string | null>(null);
   const lastPointRef = useRef<Point | undefined>(undefined);
   const pendingRef = useRef<Point[]>([]);
   const frameRef = useRef<number | null>(null);
-  const callbacksRef = useRef<Callbacks>(callbacks);
-  callbacksRef.current = callbacks;
+  const startRef = useRef<Point | null>(null);
+  const tapRef = useRef<Point | null>(null);
+  const callbacksRef = useRef<Partial<Callbacks>>({ onBegin, onPoints, onEnd, onShape, onFill, onPickColor });
+  callbacksRef.current = { onBegin, onPoints, onEnd, onShape, onFill, onPickColor };
+
+  // Clear markers reset everything before them so the visible board matches
+  // the server's action history.
+  const visible = useMemo(() => {
+    const out: Stroke[] = [];
+    for (const action of strokes) {
+      if (action.kind === "clear") out.length = 0;
+      else out.push(action);
+    }
+    return out;
+  }, [strokes]);
 
   const flushFrame = () => {
     frameRef.current = null;
@@ -107,7 +236,7 @@ export default function DrawingCanvas({ strokes, editable, hint, width, ...callb
     const points = pendingRef.current;
     if (!id || points.length === 0) return;
     pendingRef.current = [];
-    callbacksRef.current.onPoints(id, points);
+    callbacksRef.current.onPoints?.(id, points);
   };
 
   const scheduleFlush = () => {
@@ -125,13 +254,18 @@ export default function DrawingCanvas({ strokes, editable, hint, width, ...callb
     flushFrame();
     strokeIdRef.current = null;
     lastPointRef.current = undefined;
-    callbacksRef.current.onEnd(id);
+    callbacksRef.current.onEnd?.(id);
   };
 
-  // Never leave a stroke open if the canvas becomes read-only mid-gesture
-  // (round change, drawer hand-off, disconnect).
+  // Never leave a gesture open if the canvas becomes read-only mid-gesture.
   useEffect(() => {
-    if (!editable && strokeIdRef.current) endStroke();
+    if (!editable) {
+      if (strokeIdRef.current) endStroke();
+      setPreview(null);
+      setRing(null);
+      startRef.current = null;
+      tapRef.current = null;
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
 
@@ -142,47 +276,96 @@ export default function DrawingCanvas({ strokes, editable, hint, width, ...callb
     [],
   );
 
-  const handleLayout = (event: LayoutChangeEvent) => {
-    const { width: w, height: h } = event.nativeEvent.layout;
-    setSize({ width: w, height: h });
+  const pointFromEvent = (event: GestureResponderEvent): Point =>
+    normalizeTouch(event.nativeEvent.locationX, event.nativeEvent.locationY, measured.width, measured.height);
+
+  const beginFreehand = (point: Point) => {
+    const id = makeId("stroke");
+    strokeIdRef.current = id;
+    lastPointRef.current = point;
+    pendingRef.current = [];
+    callbacksRef.current.onBegin?.(id, point);
   };
 
-  const pointFromEvent = (event: GestureResponderEvent): Point =>
-    normalizeTouch(event.nativeEvent.locationX, event.nativeEvent.locationY, size.width, size.height);
-
   const handleStart = (event: GestureResponderEvent) => {
-    if (!editable || size.width <= 0) return;
-    // Second finger or palm: ignore the gesture entirely instead of drawing a
-    // line between two touches. One stroke per pointer is the whole rule.
+    if (!editable || measured.width <= 0) return;
     if (event.nativeEvent.touches.length > 1) {
       endStroke();
       return;
     }
     const point = pointFromEvent(event);
-    const id = makeStrokeId();
-    strokeIdRef.current = id;
-    lastPointRef.current = point;
-    pendingRef.current = [];
-    callbacksRef.current.onBegin(id, point);
+    setRing(point);
+    startRef.current = point;
+    tapRef.current = point;
+
+    if (tool === "fill" || tool === "dropper") return;
+    if (tool === "brush" || tool === "eraser") {
+      beginFreehand(point);
+      return;
+    }
+    if (!isShapeTool(tool)) return;
+    setPreview({ kind: shapeKind(tool), start: point, end: point });
   };
 
   const handleMove = (event: GestureResponderEvent) => {
-    if (!editable || !strokeIdRef.current) return;
+    if (!editable) return;
     const point = pointFromEvent(event);
-    if (!shouldSamplePoint(lastPointRef.current, point)) return;
-    lastPointRef.current = point;
-    pendingRef.current.push(point);
-    scheduleFlush();
+    setRing(point);
+    if (strokeIdRef.current) {
+      if (!shouldSamplePoint(lastPointRef.current, point)) return;
+      lastPointRef.current = point;
+      pendingRef.current.push(point);
+      scheduleFlush();
+      return;
+    }
+    const start = startRef.current;
+    if (start && isShapeTool(tool)) {
+      setPreview({ kind: shapeKind(tool), start, end: point });
+    }
   };
 
   const handleRelease = () => {
-    if (strokeIdRef.current) endStroke();
+    setRing(null);
+    const start = startRef.current;
+    const tapped = tapRef.current;
+    startRef.current = null;
+    tapRef.current = null;
+
+    if (strokeIdRef.current) {
+      endStroke();
+      return;
+    }
+    if (!start || !tapped) return;
+
+    if (tool === "dropper") {
+      const grid = rasterize(strokes.filter((action) => action.complete));
+      callbacksRef.current.onPickColor?.(sampleColor(grid, tapped));
+      return;
+    }
+    if (tool === "fill") {
+      const grid = rasterize(strokes.filter((action) => action.complete));
+      const runs = floodFillRuns(grid, tapped, color);
+      if (runs.length) callbacksRef.current.onFill?.(runs, color);
+      return;
+    }
+
+    if (!isShapeTool(tool)) return;
+    const current = preview?.end ?? start;
+    setPreview(null);
+    const moved = Math.hypot(current.x - start.x, current.y - start.y);
+    if (moved < 0.008) return;
+    callbacksRef.current.onShape?.(makeId(tool), shapeKind(tool), start, current);
   };
 
   return (
     <View
+      testID="skrible-drawing-canvas"
+      collapsable={false}
       style={[styles.wrapper, width != null ? { width, height: width * 0.75 } : null]}
-      onLayout={handleLayout}
+      onLayout={(event: LayoutChangeEvent) => {
+        const { width: w, height: h } = event.nativeEvent.layout;
+        setMeasured({ width: w, height: h });
+      }}
       onStartShouldSetResponder={() => editable}
       onMoveShouldSetResponder={() => editable}
       onResponderGrant={handleStart}
@@ -194,23 +377,72 @@ export default function DrawingCanvas({ strokes, editable, hint, width, ...callb
     >
       <View pointerEvents="none" style={StyleSheet.absoluteFill}>
         <Canvas style={StyleSheet.absoluteFill}>
-          {size.width > 0
-            ? strokes.map((stroke) => (
-                <StrokeShape
-                  key={stroke.id}
-                  stroke={stroke}
-                  canvasWidth={size.width}
-                  canvasHeight={size.height}
-                />
-              ))
+          {measured.width > 0
+            ? visible.map((action) => {
+                if (action.kind === "fill") {
+                  return (
+                    <FillShape
+                      key={action.id}
+                      stroke={action}
+                      canvasWidth={measured.width}
+                      canvasHeight={measured.height}
+                    />
+                  );
+                }
+                if (action.kind === "line" || action.kind === "rect" || action.kind === "ellipse") {
+                  if (action.x1 == null || action.y1 == null || action.x2 == null || action.y2 == null) return null;
+                  return (
+                    <ShapeMark
+                      key={action.id}
+                      kind={action.kind}
+                      x1={action.x1}
+                      y1={action.y1}
+                      x2={action.x2}
+                      y2={action.y2}
+                      color={action.color}
+                      width={action.width}
+                      canvasWidth={measured.width}
+                      canvasHeight={measured.height}
+                    />
+                  );
+                }
+                return (
+                  <StrokeShape
+                    key={action.id}
+                    stroke={action}
+                    canvasWidth={measured.width}
+                    canvasHeight={measured.height}
+                  />
+                );
+              })
             : null}
+          {preview ? (
+            <ShapeMark
+              kind={preview.kind}
+              x1={preview.start.x}
+              y1={preview.start.y}
+              x2={preview.end.x}
+              y2={preview.end.y}
+              color={color}
+              width={size}
+              canvasWidth={measured.width}
+              canvasHeight={measured.height}
+              opacity={0.55}
+            />
+          ) : null}
+          {ring ? (
+            <Circle
+              cx={ring.x * measured.width}
+              cy={ring.y * measured.height}
+              r={Math.max(6, widthFor(size, measured.width) / 2 + 4)}
+              color={tool === "eraser" ? "#000000" : color}
+              style="stroke"
+              strokeWidth={1.5}
+              opacity={0.6}
+            />
+          ) : null}
         </Canvas>
       </View>
-      {hint ? (
-        <View pointerEvents="none" style={styles.hint}>
-          <Text style={styles.hintText}>{hint}</Text>
-        </View>
-      ) : null}
     </View>
   );
 }
@@ -222,25 +454,6 @@ const styles = StyleSheet.create({
     width: "100%",
     aspectRatio: 4 / 3,
     backgroundColor: "#FFFFFF",
-    overflow: "hidden",
-  },
-  /* The wrapper owns the aspect ratio; the Skia canvas fills it exactly. */
-  hint: {
-    position: "absolute",
-    top: 12,
-    left: 12,
-    right: 12,
-    alignItems: "center",
-  },
-  hintText: {
-    backgroundColor: "rgba(0,0,0,0.08)",
-    color: "#000000",
-    fontSize: 11,
-    fontWeight: "800",
-    letterSpacing: 0.4,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 999,
     overflow: "hidden",
   },
 });

@@ -1,9 +1,9 @@
-import type { Point, RoomUpdate, Stroke, Tool } from "../game/types";
+import type { FillRun, Point, RoomUpdate, Stroke, StrokeKind, Tool } from "../game/types";
 
 /**
  * Local mirror of the server's authoritative board. Every mutation here has a
  * matching server event; nothing is applied optimistically except the drawer's
- * own in-progress stroke (which the server validates on arrival).
+ * own in-progress action (which the server validates on arrival).
  */
 export type Board = {
   strokes: Stroke[];
@@ -15,7 +15,8 @@ export const emptyBoard = (): Board => ({ strokes: [], undoDepth: 0, redoDepth: 
 
 const cloneStroke = (stroke: Stroke, points?: Point[]): Stroke => ({
   ...stroke,
-  points: points ?? stroke.points.map((p) => ({ x: p.x, y: p.y })),
+  points: points ?? (stroke.points ?? []).map((p) => ({ x: p.x, y: p.y })),
+  ...(stroke.runs ? { runs: stroke.runs.map((run) => ({ ...run })) } : {}),
 });
 
 export const boardFromRoom = (
@@ -39,8 +40,71 @@ export function beginStroke(
     width: input.width,
     tool: input.tool,
     complete: false,
+    kind: "stroke",
   };
   const strokes = [...board.strokes, stroke];
+  return { strokes, undoDepth: strokes.length, redoDepth: 0 };
+}
+
+/** Appends a committed line / rect / ellipse action to the local board. */
+export function addShape(
+  board: Board,
+  input: {
+    id: string;
+    seq?: number;
+    kind: Extract<StrokeKind, "line" | "rect" | "ellipse">;
+    color: string;
+    width: number;
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  },
+): Board {
+  if (board.strokes.some((stroke) => stroke.id === input.id)) return board;
+  const stroke: Stroke = {
+    id: input.id,
+    seq: input.seq ?? board.strokes.length,
+    points: [],
+    color: input.color,
+    width: input.width,
+    tool: "pen",
+    complete: true,
+    kind: input.kind,
+    x1: input.x1,
+    y1: input.y1,
+    x2: input.x2,
+    y2: input.y2,
+  };
+  const strokes = [...board.strokes, stroke];
+  return { strokes, undoDepth: strokes.length, redoDepth: 0 };
+}
+
+/** Appends a flood-fill action (scanline runs) to the local board. */
+export function addFill(
+  board: Board,
+  input: { id: string; seq?: number; color: string; runs: FillRun[] },
+): Board {
+  if (board.strokes.some((stroke) => stroke.id === input.id)) return board;
+  const stroke: Stroke = {
+    id: input.id,
+    seq: input.seq ?? board.strokes.length,
+    points: [],
+    color: input.color,
+    width: 1,
+    tool: "pen",
+    complete: true,
+    kind: "fill",
+    runs: input.runs.map((run) => ({ ...run })),
+  };
+  const strokes = [...board.strokes, stroke];
+  return { strokes, undoDepth: strokes.length, redoDepth: 0 };
+}
+
+/** Appends a clear marker so Undo can restore every previous action. */
+export function addClear(board: Board, action: Stroke): Board {
+  if (board.strokes.some((stroke) => stroke.id === action.id)) return board;
+  const strokes = [...board.strokes, { ...action, points: [], complete: true, kind: "clear" as const }];
   return { strokes, undoDepth: strokes.length, redoDepth: 0 };
 }
 
@@ -93,10 +157,17 @@ export function applyRedo(
   return { strokes, undoDepth: event.undoDepth, redoDepth: event.redoDepth };
 }
 
+/**
+ * New servers send the clear action so it stays in history (undoable).
+ * Legacy servers send no action, in which case the board is wiped.
+ */
 export function applyClear(
   board: Board,
-  event: { undoDepth: number; redoDepth: number },
+  event: { undoDepth: number; redoDepth: number; action?: Stroke },
 ): Board {
+  if (event.action) {
+    return addClear(board, event.action);
+  }
   return { strokes: [], undoDepth: event.undoDepth, redoDepth: event.redoDepth };
 }
 

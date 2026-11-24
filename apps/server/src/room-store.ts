@@ -1,5 +1,7 @@
 import type { RedisClient } from "./redis.js";
-import type { Room } from "./game.js";
+import type { DrawingGalleryItem, Reaction, Room, TurnSummary } from "./game.js";
+import type { CustomWordsMode } from "./custom-words.js";
+import { isCuratedCategoryId } from "./words.js";
 
 /** Six hours is longer than any legitimate match and bounds Redis growth. */
 const ROOM_TTL_SECONDS = 6 * 60 * 60;
@@ -9,11 +11,25 @@ type StoredSnapshot = {
   version: number;
   instanceId: string;
   savedAt: number;
-  room: Omit<Room, "guessed" | "bannedProfileIds" | "bannedSocketIds" | "mutedProfileIds"> & {
+  room: Omit<
+    Room,
+    | "guessed"
+    | "bannedProfileIds"
+    | "bannedSocketIds"
+    | "mutedProfileIds"
+    | "usedWords"
+    | "reactions"
+  > & {
     guessed: string[];
     bannedProfileIds: string[];
     bannedSocketIds: string[];
     mutedProfileIds: string[];
+    usedWords: string[];
+    reactions: Record<string, Reaction>;
+    customWords?: string[];
+    customWordsMode?: CustomWordsMode;
+    drawingGallery?: DrawingGalleryItem[];
+    lastTurnSummary?: TurnSummary;
   };
 };
 
@@ -26,6 +42,8 @@ export const serializeRoom = (room: Room, instanceId: string): string => {
     bannedProfileIds,
     bannedSocketIds,
     mutedProfileIds,
+    usedWords,
+    reactions,
     ...rest
   } = room;
   const snapshot: StoredSnapshot = {
@@ -38,6 +56,8 @@ export const serializeRoom = (room: Room, instanceId: string): string => {
       bannedProfileIds: [...bannedProfileIds],
       bannedSocketIds: [...bannedSocketIds],
       mutedProfileIds: [...mutedProfileIds],
+      usedWords: [...usedWords],
+      reactions: Object.fromEntries(reactions),
     },
   };
   return JSON.stringify(snapshot);
@@ -45,6 +65,10 @@ export const serializeRoom = (room: Room, instanceId: string): string => {
 
 const isStringArray = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((item) => typeof item === "string");
+
+/** Snapshots predate the free-form pack; missing entries simply start empty. */
+const sanitizeSnapshotsWords = (value: unknown): string[] =>
+  isStringArray(value) ? value.filter((word) => word.length >= 2 && word.length <= 28) : [];
 
 /**
  * Deserializes with shape checks so one corrupt Redis value cannot crash a
@@ -77,12 +101,37 @@ export const deserializeRoom = (raw: string): { room: Room; instanceId: string; 
   ) {
     return null;
   }
+  const wordMode = parsed.room.wordMode === "category" ? "category" : "random";
+  const wordCategory =
+    wordMode === "category"
+      ? isCuratedCategoryId(parsed.room.wordCategory)
+        ? parsed.room.wordCategory
+        : "animals"
+      : null;
+  const reactions = new Map<string, Reaction>();
+  if (parsed.room.reactions && typeof parsed.room.reactions === "object") {
+    for (const [playerId, reaction] of Object.entries(parsed.room.reactions)) {
+      if (reaction === "like" || reaction === "nope") reactions.set(playerId, reaction);
+    }
+  }
   const room: Room = {
     ...parsed.room,
+    wordMode,
+    wordCategory,
+    customWords: sanitizeSnapshotsWords(parsed.room.customWords),
+    customWordsMode:
+      parsed.room.customWordsMode === "mix" || parsed.room.customWordsMode === "only"
+        ? parsed.room.customWordsMode
+        : "off",
     guessed: new Set(parsed.room.guessed),
     bannedProfileIds: new Set(parsed.room.bannedProfileIds),
     bannedSocketIds: new Set(parsed.room.bannedSocketIds),
     mutedProfileIds: new Set(parsed.room.mutedProfileIds),
+    // Snapshots written before word modes existed deserialize to a fresh pass.
+    usedWords: new Set(isStringArray(parsed.room.usedWords) ? parsed.room.usedWords : []),
+    reactions,
+    drawingGallery: Array.isArray(parsed.room.drawingGallery) ? parsed.room.drawingGallery : [],
+    lastTurnSummary: parsed.room.lastTurnSummary,
   };
   return { room, instanceId: parsed.instanceId, savedAt: parsed.savedAt };
 };

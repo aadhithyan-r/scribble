@@ -85,9 +85,23 @@ test("undo and redo follow the server's depths", () => {
   assert.equal(applyRedo(redone, { stroke, undoDepth: 1, redoDepth: 0 }), redone);
 });
 
-test("clear empties the board", () => {
-  const cleared = applyClear(withStroke(), { undoDepth: 0, redoDepth: 0 });
-  assert.equal(cleared.strokes.length, 0);
+test("clear is kept in history so undo can restore the board", () => {
+  const action: Stroke = {
+    id: "clear-1",
+    seq: 1,
+    points: [],
+    color: "#FFFFFF",
+    width: 1,
+    tool: "pen",
+    complete: true,
+    kind: "clear",
+  };
+  const cleared = applyClear(withStroke(), { undoDepth: 2, redoDepth: 0, action });
+  assert.equal(cleared.strokes.length, 2);
+  assert.equal(cleared.strokes[1]!.kind, "clear");
+
+  // Legacy servers send no action; those still wipe the board outright.
+  assert.equal(applyClear(withStroke(), { undoDepth: 0, redoDepth: 0 }).strokes.length, 0);
 });
 
 test("boardFromRoom copies server strokes", () => {

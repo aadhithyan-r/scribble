@@ -199,8 +199,13 @@ test("stroke sync, drawer-only permissions, undo/redo and clear over real socket
 
   const cleared = waitFor(b, "draw:clear");
   assert.equal((await call(a, "draw:clear")).ok, true);
-  await cleared;
-  assert.equal((await call(b, "room:sync")).room.strokes.length, 0);
+  const clearEvent = await cleared;
+  assert.equal(clearEvent.action.kind, "clear");
+  assert.equal(clearEvent.undoDepth, 2);
+  const clearedRoom = (await call(b, "room:sync")).room;
+  assert.equal(clearedRoom.strokes.length, 2);
+  assert.equal(clearedRoom.strokes[1].kind, "clear");
+  assert.equal(clearedRoom.undoDepth, 2);
 
   // The secret word was never sent to the guessing player.
   const guesserStream = JSON.stringify(seenByGuesser);
@@ -358,7 +363,7 @@ test("three private choices, chat, redaction and announced correct guesses", asy
   while (drawing.status !== "drawing") drawing = await waitFor(b, "room:update");
   assert.equal(drawing.secretWord, undefined);
   assert.equal(drawing.wordChoices, undefined);
-  assert.equal(drawing.maskedWord, "_".repeat(chosen.length));
+  assert.equal(drawing.maskedWord, chosen.replace(/[A-Za-z0-9]/g, "_"));
   assert.equal(drawing.isDrawer, false);
 
   const drawerSync = await call(a, "room:sync");
@@ -549,7 +554,10 @@ test("an expired word choice auto-starts the drawing phase", async (t) => {
   const guesserView = await call(b, "room:sync");
   assert.equal(guesserView.room.secretWord, undefined);
   assert.equal(guesserView.room.wordChoices, undefined);
-  assert.equal(guesserView.room.maskedWord, "_".repeat(room.secretWord!.length));
+  assert.equal(
+    guesserView.room.maskedWord,
+    room.secretWord!.replace(/[A-Za-z0-9]/g, "_"),
+  );
 
   const guess = await call(b, "chat:guess", { text: room.secretWord });
   assert.equal(guess.correct, true);

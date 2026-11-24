@@ -7,11 +7,28 @@ import {
   type AvatarId,
   type WordCategory,
 } from "./validation.js";
+import {
+  CURATED_WORD_POOL,
+  CURATED_WORDS_BY_CATEGORY,
+  isCuratedCategoryId,
+  type CuratedCategoryId,
+  type WordMode,
+} from "./words.js";
+import { isCloseGuess } from "./close-guess.js";
+import {
+  MIN_CUSTOM_PACK_WORDS,
+  sanitizeCustomWords,
+  type CustomWordsMode,
+} from "./custom-words.js";
 
 export type { AvatarId, WordCategory } from "./validation.js";
+export type { CuratedCategoryId, WordMode } from "./words.js";
+export type { CustomWordsMode } from "./custom-words.js";
 
 export type Point = { x: number; y: number };
 export type Tool = "pen" | "eraser";
+export type StrokeKind = "stroke" | "line" | "rect" | "ellipse" | "fill" | "clear";
+export type FillRun = { x: number; y: number; w: number; h: number };
 
 export type Stroke = {
   /** Client-generated id, unique per room. Used to correlate live point chunks. */
@@ -24,6 +41,15 @@ export type Stroke = {
   width: number;
   tool: Tool;
   complete: boolean;
+  /** Absent on legacy strokes, which are plain freehand marks. */
+  kind?: StrokeKind;
+  /** Shape bounds for line / rect / ellipse, normalized 0..1. */
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+  /** Scanline flood-fill runs, normalized 0..1. */
+  runs?: FillRun[];
   /** Highest applied client chunk sequence, used to ignore retransmits. */
   chunkSeq?: number;
 };
@@ -58,6 +84,31 @@ export type Spectator = {
 export type RoomStatus = "lobby" | "choosing" | "drawing" | "ended";
 
 export type ChatKind = "chat" | "system" | "correct";
+
+export type Reaction = "like" | "nope";
+
+export type DrawingGalleryItem = {
+  id: string;
+  roundNumber: number;
+  word: string;
+  drawerId?: string;
+  drawerName: string;
+  drawerAvatar: AvatarId;
+  /** Exact normalized 1000 x 750 actions captured at the end of the turn. */
+  actions: Stroke[];
+  likes: number;
+  nopes: number;
+};
+
+export type TurnSummary = {
+  id: string;
+  roundNumber: number;
+  drawerId?: string;
+  drawerName: string;
+  likes: number;
+  nopes: number;
+  reactionBonus: number;
+};
 
 export type ChatMessage = {
   id: string;
@@ -103,6 +154,18 @@ export type Room = {
   allowSpectators: boolean;
   categories: WordCategory[];
   customWordsEnabled: boolean;
+  /** Host-supplied pack, already sanitized and deduplicated server-side. */
+  customWords: string[];
+  customWordsMode: CustomWordsMode;
+  /** Curated word selection for this room. */
+  wordMode: WordMode;
+  wordCategory: CuratedCategoryId | null;
+  /** Words already offered this match; prevents repeats until a pool resets. */
+  usedWords: Set<string>;
+  /** One crowd vote per player, cleared at the start of every turn. */
+  reactions: Map<string, Reaction>;
+  drawingGallery: DrawingGalleryItem[];
+  lastTurnSummary?: TurnSummary;
   /** Profile ids banned from this room for its lifetime. */
   bannedProfileIds: Set<string>;
   /** Socket ids banned immediately, even if a new profile is presented. */
@@ -138,6 +201,7 @@ export type GameErrorCode =
   | "BANNED"
   | "MUTED"
   | "SPECTATORS_FULL"
+  | "CANT_REACT"
   | "CANT_MODERATE"
   | "INVALID_REPORT"
   | "RATE_LIMITED";
@@ -174,6 +238,8 @@ export const GAME_LIMITS = {
   maxChatHistory: 80,
   chooseSeconds: 15,
   drawSeconds: 80,
+  reactionBonus: 20,
+  maxDrawingGallery: 24,
 } as const;
 
 export type RoomSettings = {
@@ -181,9 +247,18 @@ export type RoomSettings = {
   drawSeconds?: number;
   maxPlayers?: number;
   customWordsEnabled?: boolean;
+  customWords?: string | string[];
+  customWordsMode?: CustomWordsMode;
   allowSpectators?: boolean;
   requireInvite?: boolean;
   visibility?: "private" | "public";
+  wordMode?: WordMode;
+  wordCategory?: CuratedCategoryId | null;
+};
+
+export type RoomWordOptions = {
+  wordMode?: WordMode;
+  wordCategory?: CuratedCategoryId | null;
 };
 
 export type JoinOptions = {
@@ -197,19 +272,6 @@ export type JoinResult = {
   spectator: boolean;
   sessionToken: string;
 };
-
-const WORDS = [
-  "telescope",
-  "watermelon",
-  "volcano",
-  "skateboard",
-  "butterfly",
-  "lighthouse",
-  "pineapple",
-  "spaceship",
-  "toothbrush",
-  "octopus",
-];
 
 export type StrokeInput = {
   id: string;
@@ -226,7 +288,17 @@ export type GuessResult =
       score: number;
       drawerPoints: number;
     }
-  | { correct: false };
+  | { correct: false; close?: true };
+
+export const reactionCountsFor = (room: Pick<Room, "reactions">) => {
+  let likes = 0;
+  let nopes = 0;
+  for (const reaction of room.reactions.values()) {
+    if (reaction === "like") likes += 1;
+    else nopes += 1;
+  }
+  return { likes, nopes };
+};
 
 const isNormalizedPoint = (p: Point) =>
   Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
@@ -288,8 +360,25 @@ export class Game {
   rooms = new Map<string, Room>();
   playerRoom = new Map<string, string>();
 
-  createRoom(playerId: string, name: string, profileId = playerId, avatar: AvatarId = resolveAvatar(undefined)) {
+  createRoom(
+    playerId: string,
+    name: string,
+    profileId = playerId,
+    avatar: AvatarId = resolveAvatar(undefined),
+    options: RoomWordOptions = {},
+  ) {
     const code = this.uniqueCode();
+    const wordMode: WordMode =
+      options.wordMode === "category" ||
+      (options.wordMode === undefined && isCuratedCategoryId(options.wordCategory))
+        ? "category"
+        : "random";
+    const wordCategory: CuratedCategoryId | null =
+      wordMode === "category"
+        ? isCuratedCategoryId(options.wordCategory)
+          ? options.wordCategory
+          : "animals"
+        : null;
     const room: Room = {
       roomId: randomUUID(),
       code,
@@ -328,6 +417,13 @@ export class Game {
       allowSpectators: true,
       categories: [],
       customWordsEnabled: false,
+      customWords: [],
+      customWordsMode: "off",
+      wordMode,
+      wordCategory,
+      usedWords: new Set(),
+      reactions: new Map(),
+      drawingGallery: [],
       bannedProfileIds: new Set(),
       bannedSocketIds: new Set(),
       mutedProfileIds: new Set(),
@@ -416,6 +512,11 @@ export class Game {
       if (room.hostId === previousId) room.hostId = newSocketId;
       if (room.drawerId === previousId) room.drawerId = newSocketId;
       if (room.guessed.delete(previousId)) room.guessed.add(newSocketId);
+      const reaction = room.reactions.get(previousId);
+      if (reaction) {
+        room.reactions.delete(previousId);
+        room.reactions.set(newSocketId, reaction);
+      }
     }
     seat.connected = true;
     seat.reconnecting = false;
@@ -448,9 +549,19 @@ export class Game {
         `Add at least ${GAME_LIMITS.minCustomWords} custom words or turn them off`,
       );
     }
+    if (room.customWordsMode === "only" && room.customWords.length < MIN_CUSTOM_PACK_WORDS) {
+      throw new GameError(
+        "INVALID_CONFIG",
+        `Custom-only mode needs at least ${MIN_CUSTOM_PACK_WORDS} valid words. Add more or switch to Mix In.`,
+      );
+    }
     room.status = "choosing";
     room.round = 1;
     room.turnIndex = -1;
+    room.usedWords.clear();
+    room.reactions.clear();
+    room.drawingGallery = [];
+    room.lastTurnSummary = undefined;
     room.maxRounds = Math.max(1, room.maxRounds);
     room.startedAt = Date.now();
     room.endedAt = undefined;
@@ -460,6 +571,8 @@ export class Game {
   }
 
   nextTurn(room: Room) {
+    this.captureTurnEnd(room);
+    room.reactions.clear();
     const count = room.players.length;
     if (count === 0) {
       room.status = "ended";
@@ -576,6 +689,40 @@ export class Game {
       }
       room.customWordsEnabled = patch.customWordsEnabled;
     }
+    if (patch.customWordsMode !== undefined) {
+      if (!["off", "mix", "only"].includes(patch.customWordsMode)) {
+        throw new GameError("INVALID_CONFIG", "Word pack mode must be off, mix or only");
+      }
+      room.customWordsMode = patch.customWordsMode;
+    }
+    if (patch.customWords !== undefined) {
+      room.customWords = sanitizeCustomWords(patch.customWords);
+    }
+    // Validate the whole patch before mutating so a rejected update leaves the
+    // room exactly as it was.
+    let nextWordMode = room.wordMode;
+    let nextWordCategory = room.wordCategory;
+    if (patch.wordMode !== undefined) {
+      if (patch.wordMode !== "random" && patch.wordMode !== "category") {
+        throw new GameError("INVALID_CONFIG", "Word mode must be random or category");
+      }
+      nextWordMode = patch.wordMode;
+      nextWordCategory =
+        patch.wordMode === "random" ? null : (nextWordCategory ?? "animals");
+    }
+    if (patch.wordCategory !== undefined) {
+      if (patch.wordCategory === null) {
+        nextWordCategory = nextWordMode === "category" ? "animals" : null;
+      } else {
+        if (!isCuratedCategoryId(patch.wordCategory)) {
+          throw new GameError("INVALID_CONFIG", "Unknown word category");
+        }
+        nextWordMode = "category";
+        nextWordCategory = patch.wordCategory;
+      }
+    }
+    room.wordMode = nextWordMode;
+    room.wordCategory = nextWordCategory;
     if (patch.allowSpectators !== undefined) room.allowSpectators = patch.allowSpectators;
     if (patch.requireInvite !== undefined) room.requireInvite = patch.requireInvite;
     if (patch.visibility !== undefined) room.visibility = patch.visibility;
@@ -695,7 +842,42 @@ export class Game {
         drawerPoints: GAME_LIMITS.drawerPointsPerGuess,
       };
     }
+    if (isCloseGuess(raw, room.secretWord)) return { correct: false, close: true };
     return { correct: false };
+  }
+
+  /**
+   * Crowd reactions are private per turn: one vote per player, and repeats are
+   * ignored instead of overwriting the first impression.
+   */
+  react(
+    room: Room,
+    playerId: string,
+    reaction: Reaction,
+  ): { duplicate: boolean; reaction: Reaction; likes: number; nopes: number; voterName: string } {
+    if (room.status !== "drawing") {
+      throw new GameError("WRONG_PHASE", "Reactions are only open while someone is drawing");
+    }
+    const player = room.players.find((p) => p.id === playerId);
+    if (!player || playerId === room.drawerId) {
+      throw new GameError("CANT_REACT", "Only guessers can react to the drawing");
+    }
+    const existing = room.reactions.get(playerId);
+    if (existing) {
+      const counts = this.reactionCounts(room);
+      return { duplicate: true, reaction: existing, voterName: player.name, ...counts };
+    }
+    room.reactions.set(playerId, reaction);
+    return {
+      duplicate: false,
+      reaction,
+      voterName: player.name,
+      ...this.reactionCounts(room),
+    };
+  }
+
+  reactionCounts(room: Room) {
+    return reactionCountsFor(room);
   }
 
   updateIdentity(room: Room, playerId: string, name: string, avatar: AvatarId) {
@@ -789,6 +971,81 @@ export class Game {
       width: input.width,
       tool: input.tool,
       complete: false,
+      kind: "stroke",
+    };
+    room.strokes.push(stroke);
+    room.redoStack = [];
+    room.boardVersion += 1;
+    return stroke;
+  }
+
+  /** Commits a vector line / rectangle / ellipse as one history action. */
+  addShape(
+    room: Room,
+    playerId: string,
+    input: {
+      id: string;
+      kind: "line" | "rect" | "ellipse";
+      color: string;
+      width: number;
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+    },
+  ) {
+    this.assertActiveDrawer(room, playerId);
+    if (room.strokes.some((s) => s.id === input.id)) {
+      throw new GameError("INVALID_STROKE", "Duplicate stroke id");
+    }
+    if (room.strokes.length >= GAME_LIMITS.maxStrokes) {
+      throw new GameError("BOARD_FULL", "The canvas is full. Clear it to keep drawing.");
+    }
+    const open = room.strokes[room.strokes.length - 1];
+    if (open && !open.complete) open.complete = true;
+
+    const stroke: Stroke = {
+      id: input.id,
+      seq: room.nextStrokeSeq++,
+      points: [],
+      color: input.color,
+      width: input.width,
+      tool: "pen",
+      complete: true,
+      kind: input.kind,
+      x1: input.x1,
+      y1: input.y1,
+      x2: input.x2,
+      y2: input.y2,
+    };
+    room.strokes.push(stroke);
+    room.redoStack = [];
+    room.boardVersion += 1;
+    return stroke;
+  }
+
+  /** Commits a flood-fill action made of merged scanline runs. */
+  addFill(room: Room, playerId: string, input: { id: string; color: string; runs: FillRun[] }) {
+    this.assertActiveDrawer(room, playerId);
+    if (room.strokes.some((s) => s.id === input.id)) {
+      throw new GameError("INVALID_STROKE", "Duplicate stroke id");
+    }
+    if (room.strokes.length >= GAME_LIMITS.maxStrokes) {
+      throw new GameError("BOARD_FULL", "The canvas is full. Clear it to keep drawing.");
+    }
+    const open = room.strokes[room.strokes.length - 1];
+    if (open && !open.complete) open.complete = true;
+
+    const stroke: Stroke = {
+      id: input.id,
+      seq: room.nextStrokeSeq++,
+      points: [],
+      color: input.color,
+      width: 1,
+      tool: "pen",
+      complete: true,
+      kind: "fill",
+      runs: input.runs.map((run) => ({ x: run.x, y: run.y, w: run.w, h: run.h })),
     };
     room.strokes.push(stroke);
     room.redoStack = [];
@@ -875,10 +1132,23 @@ export class Game {
     return stroke;
   }
 
+  /** Clear is a history action, so Undo restores everything it hid. */
   clearBoard(room: Room, playerId: string) {
     this.assertActiveDrawer(room, playerId);
-    this.resetBoard(room);
-    return room;
+    const action: Stroke = {
+      id: `clear_${randomUUID()}`,
+      seq: room.nextStrokeSeq++,
+      points: [],
+      color: "#FFFFFF",
+      width: 1,
+      tool: "pen",
+      complete: true,
+      kind: "clear",
+    };
+    room.strokes.push(action);
+    room.redoStack = [];
+    room.boardVersion += 1;
+    return action;
   }
 
   leave(playerId: string) {
@@ -906,8 +1176,12 @@ export class Game {
 
     room.players.splice(index, 1);
     room.guessed.delete(playerId);
+    room.reactions.delete(playerId);
 
+    // With the last player gone the room has no one to host it; keep it open
+    // briefly so spectators can still read the results.
     if (!room.players.length) {
+      room.players = [];
       // Spectators may still be watching the result; keep the room briefly but
       // mark it ended. With nobody left at all the room is released immediately.
       room.status = "ended";
@@ -930,7 +1204,7 @@ export class Game {
     }
 
     if (room.hostId === playerId) {
-      room.hostId = room.players[Math.min(index, room.players.length - 1)]!.id;
+      room.hostId = room.players[0]!.id;
     }
 
     if (index < room.turnIndex) room.turnIndex -= 1;
@@ -966,15 +1240,86 @@ export class Game {
     this.rooms.delete(room.code);
   }
 
-  private pickWordChoices(room: Room) {
-    const custom = room.customWordsEnabled ? this.customWordPool(room) : [];
-    const pool =
-      custom.length >= GAME_LIMITS.wordChoiceCount ? [...new Set(custom)] : [...WORDS];
-    const choices: string[] = [];
-    while (choices.length < GAME_LIMITS.wordChoiceCount && pool.length > 0) {
-      const index = Math.floor(Math.random() * pool.length);
-      choices.push(pool.splice(index, 1)[0]!);
+  /** Exposed for deterministic pool tests; socket callers only see the result. */
+  wordPoolFor(room: Room) {
+    const legacy = room.customWordsEnabled ? this.customWordPool(room) : [];
+    const curated =
+      room.wordMode === "category" && room.wordCategory
+        ? CURATED_WORDS_BY_CATEGORY[room.wordCategory]
+        : CURATED_WORD_POOL;
+    const base = legacy.length >= GAME_LIMITS.wordChoiceCount ? legacy : curated;
+
+    if (room.customWordsMode === "only") {
+      return [...new Set(room.customWords.map((word) => word.trim()).filter(Boolean))];
     }
+    if (room.customWordsMode === "mix") {
+      return [
+        ...new Set(
+          [...base, ...room.customWords]
+            .map((word) => word.trim().replace(/\s+/g, " "))
+            .filter(Boolean),
+        ),
+      ];
+    }
+    return [...new Set(base.map((word) => word.trim()).filter(Boolean))];
+  }
+
+  /**
+   * Captures a finished drawing before the board is reset. This is also the
+   * only place the crowd bonus is awarded, so it can never pay out twice.
+   */
+  private captureTurnEnd(room: Room) {
+    if (room.status !== "drawing" || !room.secretWord || !room.drawerId) return;
+    const drawer = room.players.find((player) => player.id === room.drawerId);
+    const { likes, nopes } = this.reactionCounts(room);
+    const reactionBonus = likes >= 1 && likes > nopes ? GAME_LIMITS.reactionBonus : 0;
+    if (reactionBonus > 0 && drawer) drawer.score += reactionBonus;
+
+    room.drawingGallery.push({
+      id: randomUUID(),
+      roundNumber: room.round,
+      word: room.secretWord,
+      drawerId: room.drawerId,
+      drawerName: drawer?.name ?? "DRAWER",
+      drawerAvatar: drawer?.avatar ?? resolveAvatar(undefined),
+      actions: room.strokes.map((stroke) => ({
+        ...stroke,
+        points: stroke.points.map((point) => ({ x: point.x, y: point.y })),
+      })),
+      likes,
+      nopes,
+    });
+    if (room.drawingGallery.length > GAME_LIMITS.maxDrawingGallery) {
+      room.drawingGallery.splice(0, room.drawingGallery.length - GAME_LIMITS.maxDrawingGallery);
+    }
+    room.lastTurnSummary = {
+      id: randomUUID(),
+      roundNumber: room.round,
+      drawerId: room.drawerId,
+      drawerName: drawer?.name ?? "DRAWER",
+      likes,
+      nopes,
+      reactionBonus,
+    };
+  }
+
+  private pickWordChoices(room: Room) {
+    const pool = [...new Set(this.wordPoolFor(room))];
+    let available = pool.filter((word) => !room.usedWords.has(word));
+    // A very long match can exhaust even the full 225-word mix. Start a fresh
+    // pass instead of ending the round with too few words to choose from.
+    if (available.length < GAME_LIMITS.wordChoiceCount) {
+      room.usedWords.clear();
+      available = pool;
+    }
+    const choices: string[] = [];
+    while (choices.length < GAME_LIMITS.wordChoiceCount && available.length > 0) {
+      const index = Math.floor(Math.random() * available.length);
+      choices.push(available.splice(index, 1)[0]!);
+    }
+    // Mark every offered word, not just the chosen one, so it cannot reappear
+    // in a later turn's options during this match.
+    for (const word of choices) room.usedWords.add(word);
     return choices;
   }
 
@@ -1059,8 +1404,16 @@ export const publicRoom = (room: Room, viewerId: string) => {
     visibility: room.visibility,
     requireInvite: room.requireInvite,
     allowSpectators: room.allowSpectators,
+    wordMode: room.wordMode ?? "random",
+    wordCategory:
+      (room.wordMode ?? "random") === "category" ? (room.wordCategory ?? "animals") : null,
     customWordsEnabled: room.customWordsEnabled,
-    customWordCount: customWordCount(room.categories),
+    customWordsMode: room.customWordsMode ?? "off",
+    // Raw pack entries are host-only; everyone else gets the mode and count.
+    customWords: viewerId === room.hostId ? room.customWords : undefined,
+    customWordCount: room.customWords.length,
+    /** Legacy saved-list total, kept separate from the free-form pack count. */
+    savedWordCount: customWordCount(room.categories),
     customCategories: room.categories.map((category) => category.name),
     youAreMuted: viewer ? room.mutedProfileIds.has(viewer.profileId) : false,
     startedAt: room.startedAt,
@@ -1078,6 +1431,9 @@ export const publicRoom = (room: Room, viewerId: string) => {
     undoDepth: room.strokes.length,
     redoDepth: room.redoStack.length,
     guessedIds: Array.from(room.guessed),
+    reactions: reactionCountsFor(room),
+    myReaction: room.reactions.get(viewerId) ?? null,
+    drawingGallery: room.status === "ended" ? room.drawingGallery : undefined,
     chat: room.chat.map((message) => ({ ...message })),
     chooseEndsAt: room.status === "choosing" ? room.endsAt : undefined,
     isDrawer,

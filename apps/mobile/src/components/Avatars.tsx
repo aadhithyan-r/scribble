@@ -184,11 +184,14 @@ export function Avatar({
   value,
   size = 48,
   hasCrown = false,
+  showCrown = false,
   style,
 }: {
   value?: string | null;
   size?: number;
   hasCrown?: boolean;
+  /** Explicit podium alias; either prop renders the same SVG crown. */
+  showCrown?: boolean;
   style?: StyleProp<ViewStyle>;
 }) {
   const config = parseAvatar(value);
@@ -213,7 +216,7 @@ export function Avatar({
       <Circle cx="50" cy="43" r="27" fill={avatarColor(value)} strokeWidth="4.5" />
       <Eyes index={config.eyes} />
       <Mouth index={config.mouth} />
-      {hasCrown ? <Crown /> : null}
+      {hasCrown || showCrown ? <Crown /> : null}
     </Svg>
   );
 }

@@ -28,7 +28,14 @@ export type IconName =
   | "eye"
   | "mute"
   | "dice"
-  | "star";
+  | "star"
+  | "thumbUp"
+  | "thumbDown"
+  | "fill"
+  | "dropper"
+  | "line"
+  | "rect"
+  | "ellipse";
 
 const starPath = (cx: number, cy: number, outer: number, inner: number) => {
   const points: string[] = [];
@@ -163,6 +170,33 @@ const CONTENT: Record<IconName, React.ReactNode> = {
     </>
   ),
   star: <Path d={starPath(12, 12, 9.2, 4)} />,
+  thumbUp: (
+    <>
+      <Path d="M7 10.5 10.8 3.6c.5-.9 1.9-.6 2 .4l.2 2.6c0 .5.4.9.9.9h4.4c1.3 0 2.2 1.2 1.9 2.4l-1.7 7.1a2.4 2.4 0 0 1-2.3 1.8H7Z" />
+      <Path d="M7 10.5v10.1H3.6V10.5Z" />
+    </>
+  ),
+  thumbDown: (
+    <>
+      <Path d="M17 13.5 13.2 20.4c-.5.9-1.9.6-2-.4l-.2-2.6c0-.5-.4-.9-.9-.9H5.7c-1.3 0-2.2-1.2-1.9-2.4l1.7-7.1a2.4 2.4 0 0 1 2.3-1.8H17Z" />
+      <Path d="M17 3.4h3.4v10.1H17Z" />
+    </>
+  ),
+  fill: (
+    <>
+      <Path d="M4.4 12.4 11.6 5.2l6.4 6.4-7.2 7.2a2 2 0 0 1-2.8 0l-3.6-3.6a2 2 0 0 1 0-2.8Z" />
+      <Path d="M9 3.4 6.4 6" />
+      <Path d="M20.4 15.2c1.2 1.8 1.6 2.8 1.6 3.6a1.6 1.6 0 1 1-3.2 0c0-.8.4-1.8 1.6-3.6Z" fill={colors.ink} stroke="none" />
+    </>
+  ),
+  dropper: (
+    <>
+      <Path d="M18.6 3.4a2.4 2.4 0 0 1 2 4l-3 3 1.4 1.4-2.2 2.2-1.4-1.4-6.8 6.8H5v-3.6l6.8-6.8L10.4 8l2.2-2.2 1.4 1.4 3-3a2.4 2.4 0 0 1 1.6-.8Z" />
+    </>
+  ),
+  line: <Path d="M4.4 19.6 19.6 4.4" />,
+  rect: <Rect x="4.2" y="6.2" width="15.6" height="11.6" rx="1.4" />,
+  ellipse: <Circle cx="12" cy="12" r="8" />,
 };
 
 export default function Icon({

@@ -51,7 +51,8 @@ test("custom words are validated, host-only and never public", () => {
 
   game.setCategories(room, HOST, categories);
   const guestView = publicRoom(room, GUEST);
-  assert.equal(guestView.customWordCount, 4);
+  assert.equal(guestView.customWordCount, 0);
+  assert.equal(guestView.savedWordCount, 4);
   assert.deepEqual(guestView.customCategories, ["Food"]);
   assert.equal(
     foodWords.some((word) => JSON.stringify(guestView).includes(word)),

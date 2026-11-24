@@ -204,8 +204,8 @@ test("custom words and room settings are host-only and strictly validated", asyn
   );
   assert.equal((await call(a, "room:configure", { customWordsEnabled: true })).ok, true);
 
-  const seen = await call(b, "room:sync");
-  assert.equal(seen.room.customWordCount, 4);
+  const seen = await call(b, "room:sync");      assert.equal(seen.room.customWordCount, 0);
+      assert.equal(seen.room.savedWordCount, 4);
   assert.deepEqual(seen.room.customCategories, ["Food"]);
   assert.equal(JSON.stringify(seen.room).includes("pizza"), false);
   const hostList = await call(a, "words:get");

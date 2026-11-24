@@ -2,10 +2,12 @@ import { io, Socket } from "socket.io-client";
 import { envServerUrl, normalizeServerUrl } from "./config";
 
 /**
- * Fallback only for the Android emulator's host loopback. The app refuses to
- * play until a real address is configured (see `hasConfiguredServer`).
+ * Production default. A fresh install (or one whose app data was cleared)
+ * connects here without any manual setup; the developer server screen can
+ * still override it at runtime, and EXPO_PUBLIC_SERVER_URL still wins for
+ * local builds.
  */
-const EMULATOR_URL = "http://10.0.2.2:3001";
+const PRODUCTION_URL = "https://skrible-server-production.up.railway.app";
 
 const createSocket = (url: string): Socket =>
   io(url, {
@@ -24,8 +26,10 @@ const createSocket = (url: string): Socket =>
     auth: {},
   });
 
-let currentUrl = envServerUrl() ?? EMULATOR_URL;
-let configured = envServerUrl() !== null;
+let currentUrl = envServerUrl() ?? PRODUCTION_URL;
+// The production default always counts as configured, so a clean install can
+// play immediately instead of being held on the emulator fallback.
+let configured = true;
 let lastToken: string | null = null;
 
 /**

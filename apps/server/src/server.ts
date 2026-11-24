@@ -36,6 +36,7 @@ import {
   WordListRepository,
 } from "./repositories.js";
 import { RoomStore } from "./room-store.js";
+import { CURATED_CATEGORY_IDS } from "./words.js";
 
 type Ack = ((response: Record<string, unknown>) => void) | undefined;
 
@@ -72,6 +73,37 @@ const strokePointsSchema = z
   })
   .strict();
 const strokeIdPayloadSchema = z.object({ id: strokeIdSchema }).strict();
+const shapeSchema = z
+  .object({
+    id: strokeIdSchema,
+    kind: z.enum(["line", "rect", "ellipse"]),
+    color: colorSchema,
+    width: z.number().min(1).max(40),
+    x1: z.number().min(0).max(1),
+    y1: z.number().min(0).max(1),
+    x2: z.number().min(0).max(1),
+    y2: z.number().min(0).max(1),
+  })
+  .strict();
+const fillSchema = z
+  .object({
+    id: strokeIdSchema,
+    color: colorSchema,
+    runs: z
+      .array(
+        z
+          .object({
+            x: z.number().min(0).max(1),
+            y: z.number().min(0).max(1),
+            w: z.number().min(0).max(1),
+            h: z.number().min(0).max(1),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(1200),
+  })
+  .strict();
 
 const configureSchema = z
   .object({
@@ -84,9 +116,15 @@ const configureSchema = z
       .optional(),
     maxPlayers: z.number().int().min(GAME_LIMITS.minPlayers).max(GAME_LIMITS.maxPlayers).optional(),
     customWordsEnabled: z.boolean().optional(),
+    customWords: z
+      .union([z.string().max(5000), z.array(z.string().max(64)).max(100)])
+      .optional(),
+    customWordsMode: z.enum(["off", "mix", "only"]).optional(),
     allowSpectators: z.boolean().optional(),
     requireInvite: z.boolean().optional(),
     visibility: z.enum(["private", "public"]).optional(),
+    wordMode: z.enum(["random", "category"]).optional(),
+    wordCategory: z.enum(CURATED_CATEGORY_IDS).nullable().optional(),
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0, { message: "No settings supplied" });
@@ -228,6 +266,8 @@ export function createGameServer(options: GameServerOptions = {}) {
   const rateLimits: Record<"auth" | "room" | "chat" | "draw", RateConfig> = { ...DEFAULT_LIMITS };
   let reportCooldownMs = 60_000;
   const pendingWrites = new Set<Promise<unknown>>();
+  /** Deduplicates turn:end broadcasts when a room snapshot is re-emitted. */
+  const emittedTurnSummaries = new Map<string, string>();
 
   const track = <T>(task: Promise<T>, context: string): Promise<T> => {
     pendingWrites.add(task);
@@ -271,6 +311,28 @@ export function createGameServer(options: GameServerOptions = {}) {
     saveTimers.set(room.code, timer);
   };
 
+  const finalStandings = (room: Room) =>
+    [...room.players]
+      .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+      .map((player, index) => ({
+        profileId: player.profileId,
+        name: player.name,
+        avatar: player.avatar,
+        score: player.score,
+        rank: index + 1,
+        won: index === 0,
+        guesses: player.guesses,
+        correctGuesses: player.correctGuesses,
+      }));
+
+  const emitGameOver = (room: Room, match: unknown) => {
+    io.to(room.code).emit("game:over", {
+      match,
+      players: finalStandings(room),
+      drawingGallery: room.drawingGallery,
+    });
+  };
+
   const finalizeMatch = (room: Room) => {
     if (room.status !== "ended" || room.matchRecorded) return;
     room.matchRecorded = true;
@@ -287,6 +349,7 @@ export function createGameServer(options: GameServerOptions = {}) {
         correctGuesses: player.correctGuesses,
       })),
     };
+    if (!input.players.length) return;
 
     if (infra) {
       const task = infra.matches
@@ -294,6 +357,7 @@ export function createGameServer(options: GameServerOptions = {}) {
         .then((match) => {
           room.matchId = match.id;
           io.to(room.code).emit("match:ended", match);
+          emitGameOver(room, match);
           scheduleSave(room);
         })
         .catch((error: unknown) => {
@@ -309,6 +373,7 @@ export function createGameServer(options: GameServerOptions = {}) {
     const match = profiles.recordMatch(input);
     room.matchId = match.id;
     io.to(room.code).emit("match:ended", match);
+    emitGameOver(room, match);
   };
 
   const emitRoom = (room: Room) => {
@@ -317,10 +382,16 @@ export function createGameServer(options: GameServerOptions = {}) {
     for (const spectator of room.spectators) {
       io.to(spectator.id).emit("room:update", publicRoom(room, spectator.id));
     }
+    const summary = room.lastTurnSummary;
+    if (summary && emittedTurnSummaries.get(room.code) !== summary.id) {
+      emittedTurnSummaries.set(room.code, summary.id);
+      io.to(room.code).emit("turn:end", summary);
+    }
     scheduleSave(room);
   };
 
   const roomRemoved = (code: string, updated: Room | undefined) => {
+    emittedTurnSummaries.delete(code);
     if (updated) {
       emitRoom(updated);
       return;
@@ -994,13 +1065,22 @@ export function createGameServer(options: GameServerOptions = {}) {
     socket.on("room:create", async (payload, ack: Ack) => {
       try {
         const data = z
-          .object({ name: optionalNameSchema, avatar: avatarSchema, token: profileTokenSchema })
+          .object({
+            name: optionalNameSchema,
+            avatar: avatarSchema,
+            token: profileTokenSchema,
+            wordMode: z.enum(["random", "category"]).optional(),
+            wordCategory: z.enum(CURATED_CATEGORY_IDS).nullable().optional(),
+          })
           .strict()
           .parse(payload ?? {});
         if (await rateLimited(socket, "room", ack)) return;
         const { profile, token } = await identify(data.name, data.avatar, data.token);
         detachFromPreviousRoom();
-        const room = game.createRoom(socket.id, profile.name, profile.id, profile.avatar);
+        const room = game.createRoom(socket.id, profile.name, profile.id, profile.avatar, {
+          wordMode: data.wordMode,
+          wordCategory: data.wordCategory,
+        });
         socket.join(room.code);
         bindSeatSocket(socket, room.players[0]!.sessionToken, room.code);
         if (infra) {
@@ -1624,6 +1704,32 @@ export function createGameServer(options: GameServerOptions = {}) {
       }
     });
 
+    socket.on("draw:shape", (payload, ack: Ack) => {
+      try {
+        const room = requireRoom();
+        const data = shapeSchema.parse(payload);
+        const stroke = game.addShape(room, socket.id, data);
+        scheduleSave(room);
+        socket.to(room.code).emit("draw:shape", { action: stroke, boardVersion: room.boardVersion });
+        ack?.({ ok: true, boardVersion: room.boardVersion });
+      } catch (error) {
+        fail(ack, error);
+      }
+    });
+
+    socket.on("draw:fill", (payload, ack: Ack) => {
+      try {
+        const room = requireRoom();
+        const data = fillSchema.parse(payload);
+        const stroke = game.addFill(room, socket.id, data);
+        scheduleSave(room);
+        socket.to(room.code).emit("draw:fill", { action: stroke, boardVersion: room.boardVersion });
+        ack?.({ ok: true, boardVersion: room.boardVersion });
+      } catch (error) {
+        fail(ack, error);
+      }
+    });
+
     socket.on("draw:undo", (_payload, ack: Ack) => {
       try {
         const room = requireRoom();
@@ -1663,15 +1769,39 @@ export function createGameServer(options: GameServerOptions = {}) {
     socket.on("draw:clear", (_payload, ack: Ack) => {
       try {
         const room = requireRoom();
-        game.clearBoard(room, socket.id);
+        const action = game.clearBoard(room, socket.id);
         scheduleSave(room);
         const payloadOut = {
-          undoDepth: 0,
-          redoDepth: 0,
+          action,
+          undoDepth: room.strokes.length,
+          redoDepth: room.redoStack.length,
           boardVersion: room.boardVersion,
         };
         io.to(room.code).emit("draw:clear", payloadOut);
         ack?.({ ok: true, ...payloadOut });
+      } catch (error) {
+        fail(ack, error);
+      }
+    });
+
+    socket.on("drawing:react", (payload, ack: Ack) => {
+      try {
+        const room = requireRoom();
+        const data = z
+          .object({ reaction: z.enum(["like", "nope"]) })
+          .strict()
+          .parse(payload);
+        const result = game.react(room, socket.id, data.reaction);
+        if (!result.duplicate) {
+          io.to(room.code).emit("drawing:reactionUpdate", {
+            likes: result.likes,
+            nopes: result.nopes,
+            voterName: result.voterName,
+            reaction: result.reaction,
+          });
+          emitRoom(room);
+        }
+        ack?.({ ok: true, duplicate: result.duplicate, likes: result.likes, nopes: result.nopes });
       } catch (error) {
         fail(ack, error);
       }
@@ -1743,6 +1873,13 @@ export function createGameServer(options: GameServerOptions = {}) {
               emitWordOptions(room);
             }
             ack?.({ ok: true, correct: true, score: result.score });
+            return;
+          }
+          if (result.close) {
+            // Spoiler protection: a near miss is only shown to its author, never
+            // appended to the public chat or counted as a scored guess.
+            socket.emit("guess:close", { guess: text });
+            ack?.({ ok: true, correct: false });
             return;
           }
         }

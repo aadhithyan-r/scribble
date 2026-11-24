@@ -21,6 +21,8 @@ type Props = {
   guessed: boolean;
   /** Portrait bottom bar or landscape side column. */
   style?: StyleProp<ViewStyle>;
+  /** Brief private near-miss banner floating above the input. */
+  toast?: string | null;
   onSend: (text: string) => void;
 };
 
@@ -31,6 +33,7 @@ export default function ChatPanel({
   placeholder,
   guessed,
   style,
+  toast,
   onSend,
 }: Props) {
   const [value, setValue] = useState("");
@@ -76,6 +79,14 @@ export default function ChatPanel({
                 </View>
               );
             }
+            if (message.kind === "close") {
+              return (
+                <View key={message.id} style={styles.closeBubble}>
+                  <Icon name="bolt" size={12} />
+                  <Text style={styles.closeText}>{message.text}</Text>
+                </View>
+              );
+            }
             const mine = message.playerId != null && message.playerId === meId;
             return (
               <View key={message.id} style={[styles.bubble, mine && styles.bubbleMine]}>
@@ -86,6 +97,16 @@ export default function ChatPanel({
           })
         )}
       </ScrollView>
+
+      {toast ? (
+        <View pointerEvents="none" style={styles.toastOuter}>
+          <View style={styles.toastShadow} />
+          <View style={styles.toast}>
+            <Icon name="bolt" size={13} />
+            <Text style={styles.toastText}>{toast}</Text>
+          </View>
+        </View>
+      ) : null}
 
       <View style={styles.inputRow}>
         <TextInput
@@ -171,6 +192,50 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   correctText: { fontSize: 11, lineHeight: 15, fontWeight: "900", color: colors.ink },
+  closeBubble: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    alignSelf: "flex-start",
+    borderWidth: 2,
+    borderColor: colors.ink,
+    borderRadius: 8,
+    backgroundColor: colors.gold,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  closeText: { fontSize: 11, lineHeight: 15, fontWeight: "900", color: colors.ink },
+  toastOuter: {
+    position: "absolute",
+    left: 7,
+    right: 7,
+    bottom: 55,
+    zIndex: 3,
+    paddingRight: 3,
+    paddingBottom: 3,
+  },
+  toastShadow: {
+    position: "absolute",
+    left: 3,
+    top: 3,
+    right: 0,
+    bottom: 0,
+    backgroundColor: colors.ink,
+    borderRadius: 9,
+  },
+  toast: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderWidth: BORDER_WIDTH,
+    borderColor: colors.ink,
+    borderRadius: 9,
+    backgroundColor: colors.gold,
+  },
+  toastText: { fontSize: 12, fontWeight: "900", letterSpacing: 1.1, color: colors.ink },
   inputRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   input: {
     flex: 1,

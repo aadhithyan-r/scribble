@@ -1,5 +1,13 @@
+import type { WordCategoryId, WordMode } from "./words";
+
 export type Point = { x: number; y: number };
+/** Wire tool for freehand strokes; kept for backward compatibility. */
 export type Tool = "pen" | "eraser";
+/** Local drawing tool selected in the dock. */
+export type DrawTool = "brush" | "fill" | "eraser" | "dropper" | "line" | "rect" | "circle";
+export type StrokeKind = "stroke" | "line" | "rect" | "ellipse" | "fill" | "clear";
+/** One filled horizontal run in the 250 x 188 flood-fill raster. */
+export type FillRun = { x: number; y: number; w: number; h: number };
 
 export type Stroke = {
   id: string;
@@ -9,6 +17,15 @@ export type Stroke = {
   width: number;
   tool: Tool;
   complete: boolean;
+  /** Absent on legacy strokes, which are plain freehand marks. */
+  kind?: StrokeKind;
+  /** Shape bounds for line / rect / ellipse, normalized 0..1. */
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+  /** Scanline flood-fill runs, normalized 0..1. */
+  runs?: FillRun[];
 };
 
 export type AvatarId = string;
@@ -35,7 +52,38 @@ export type SpectatorInfo = {
 
 export type RoomStatus = "lobby" | "choosing" | "drawing" | "ended";
 
-export type ChatKind = "chat" | "system" | "correct";
+export type ChatKind = "chat" | "system" | "correct" | "close";
+
+export type Reaction = "like" | "nope";
+export type CustomWordsMode = "off" | "mix" | "only";
+
+export type DrawingGalleryItem = {
+  id: string;
+  roundNumber: number;
+  word: string;
+  drawerId?: string;
+  drawerName: string;
+  drawerAvatar: AvatarId;
+  actions: Stroke[];
+  likes: number;
+  nopes: number;
+};
+
+export type TurnSummary = {
+  id: string;
+  roundNumber: number;
+  drawerId?: string;
+  drawerName: string;
+  likes: number;
+  nopes: number;
+  reactionBonus: number;
+};
+
+export type GameOverPayload = {
+  match?: MatchRecord;
+  players: MatchPlayerResult[];
+  drawingGallery: DrawingGalleryItem[];
+};
 
 export type ChatMessage = {
   id: string;
@@ -135,8 +183,16 @@ export type RoomUpdate = {
   requireInvite: boolean;
   allowSpectators: boolean;
   customWordsEnabled: boolean;
+  customWordsMode?: CustomWordsMode;
+  /** Raw host pack; omitted by the server for every non-host viewer. */
+  customWords?: string[];
   customWordCount: number;
+  /** Legacy saved-list word total, separate from the free-form pack. */
+  savedWordCount?: number;
   customCategories: string[];
+  /** Lobby word source; older servers may omit this and default to random. */
+  wordMode?: WordMode;
+  wordCategory?: WordCategoryId | null;
   youAreMuted: boolean;
   startedAt?: number;
   endedAt?: number;
@@ -150,8 +206,12 @@ export type RoomUpdate = {
   undoDepth: number;
   redoDepth: number;
   guessedIds: string[];
+  reactions?: { likes: number; nopes: number };
+  myReaction?: Reaction | null;
   chat: ChatMessage[];
   chooseEndsAt?: number;
+  /** Present only after the match ends, so reconnects can still show it. */
+  drawingGallery?: DrawingGalleryItem[];
   isDrawer: boolean;
   isSpectator: boolean;
   avatar?: AvatarId;
@@ -199,4 +259,7 @@ export type AckResponse = {
   recovered?: boolean;
   duplicate?: boolean;
   appended?: number;
+  likes?: number;
+  nopes?: number;
+  boardVersion?: number;
 };

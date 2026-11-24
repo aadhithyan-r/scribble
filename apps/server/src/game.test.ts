@@ -89,7 +89,7 @@ test("word choices and the chosen word stay private to the drawer", () => {
   const chosen = room.wordChoices[1]!;
   game.chooseWord(room, DRAWER, chosen);
   assert.equal(room.secretWord, chosen);
-  assert.equal(room.maskedWord, "_".repeat(chosen.length));
+  assert.equal(room.maskedWord, chosen.replace(/[A-Za-z0-9]/g, "_"));
   assert.equal(room.status, "drawing");
   assert.equal(room.wordChoices.length, 0);
   assert.ok(room.endsAt! > Date.now() + 70_000);
@@ -97,7 +97,7 @@ test("word choices and the chosen word stay private to the drawer", () => {
   const afterView = publicRoom(room, GUESSER);
   assert.equal(afterView.secretWord, undefined);
   assert.equal(afterView.wordChoices, undefined);
-  assert.equal(afterView.maskedWord, "_".repeat(chosen.length));
+  assert.equal(afterView.maskedWord, chosen.replace(/[A-Za-z0-9]/g, "_"));
   assert.ok(!JSON.stringify(afterView).includes(chosen));
   assert.ok(!JSON.stringify(afterView).includes("sessionToken"));
   assert.ok(!JSON.stringify(publicRoom(room, DRAWER)).includes("sessionToken"));
@@ -216,19 +216,24 @@ test("a new stroke clears the redo stack", () => {
   expectCode(() => ctx.game.redo(ctx.room, DRAWER), "NOTHING_TO_REDO");
 });
 
-test("clear empties the board and both stacks", () => {
+test("clear is an undoable history action", () => {
   const ctx = startedRoom();
   drawStroke(ctx);
   ctx.game.undo(ctx.room, DRAWER);
   assert.equal(ctx.room.redoStack.length, 1);
 
   const version = ctx.room.boardVersion;
-  ctx.game.clearBoard(ctx.room, DRAWER);
-  assert.equal(ctx.room.strokes.length, 0);
+  const action = ctx.game.clearBoard(ctx.room, DRAWER);
+  assert.equal(action.kind, "clear");
+  assert.equal(ctx.room.strokes.length, 1);
+  assert.equal(ctx.room.strokes[0]!.kind, "clear");
   assert.equal(ctx.room.redoStack.length, 0);
-  assert.equal(ctx.room.totalPoints, 0);
   assert.equal(ctx.room.boardVersion, version + 1);
-  expectCode(() => ctx.game.undo(ctx.room, DRAWER), "NOTHING_TO_UNDO");
+
+  const undone = ctx.game.undo(ctx.room, DRAWER);
+  assert.equal(undone.kind, "clear");
+  assert.equal(ctx.room.strokes.length, 0);
+  assert.equal(ctx.room.redoStack.length, 1);
 });
 
 test("the board has a hard size limit", () => {
@@ -348,7 +353,7 @@ test("the word-choice timer auto-picks one of the drawer's options", () => {
   assert.equal(tick.wordOptions, false);
   assert.equal(room.status, "drawing");
   assert.ok(choices.includes(room.secretWord!));
-  assert.equal(room.maskedWord, "_".repeat(room.secretWord!.length));
+  assert.equal(room.maskedWord, room.secretWord!.replace(/[A-Za-z0-9]/g, "_"));
   assert.equal(room.wordChoices.length, 0);
   assert.ok(room.endsAt! > Date.now() + 70_000);
 });
@@ -374,7 +379,7 @@ test("hints reveal letters over time without ever exposing the whole word", () =
   const ctx = startedRoom();
   const { game, room } = ctx;
   const word = room.secretWord!;
-  const blank = "_".repeat(word.length);
+  const blank = word.replace(/[A-Za-z0-9]/g, "_");
   assert.equal(room.maskedWord, blank);
 
   // Halfway through the turn some, but not all, letters are exposed.
@@ -541,8 +546,16 @@ test("a disconnected drawer keeps the secret and unmasks nothing for guessers", 
 
   const guesserView = publicRoom(room, GUESSER);
   assert.equal(guesserView.secretWord, undefined);
-  assert.equal(guesserView.maskedWord, "_".repeat(secret.length));
-  assert.ok(!JSON.stringify(guesserView).includes(secret));
+  assert.equal(guesserView.maskedWord, secret.replace(/[A-Za-z0-9]/g, "_"));
+  // Avatar ids can legitimately equal a short curated word (for example "fox"),
+  // so exclude cosmetic avatar labels from the secret-leak assertion.
+  const withoutAvatars = JSON.stringify({
+    ...guesserView,
+    avatar: undefined,
+    players: guesserView.players.map((player) => ({ ...player, avatar: undefined })),
+    spectators: guesserView.spectators.map((spectator) => ({ ...spectator, avatar: undefined })),
+  });
+  assert.ok(!withoutAvatars.includes(secret));
 
   const resumed = game.resumeSession(room.code, player(room, DRAWER).sessionToken, "socket-back");
   if (!resumed.player) throw new Error("expected a player seat");
